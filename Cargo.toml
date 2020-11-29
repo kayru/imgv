@@ -1,0 +1,8 @@
+[package]
+name = "imgv"
+version = "0.1.0"
+authors = ["Yuriy O'Donnell <yuriyo@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+winapi = { version = "0.3", features = ["winuser", "d3d11", "winerror", "dxgi1_2"] }
