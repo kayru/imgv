@@ -18,6 +18,7 @@ use winapi::um::d3dcommon::*;
 use winapi::um::shellscalingapi::SetProcessDpiAwareness;
 use winapi::um::winuser::*;
 use winapi::Interface;
+//use std::time::{Duration};
 
 #[repr(C)]
 #[derive(Clone)]
@@ -213,7 +214,7 @@ fn create_window() -> Result<Window, ()> {
             let mut msg: MSG = std::mem::zeroed();
 
             while !window_state.is_window_closed {
-                if PeekMessageA(&mut msg, hwnd_window, 0, 0, PM_REMOVE) > 0 {
+                if GetMessageA(&mut msg, hwnd_window, 0, 0) > 0 {
                     TranslateMessage(&msg);
                     DispatchMessageA(&msg);
                 }
@@ -231,10 +232,17 @@ fn create_window() -> Result<Window, ()> {
     Err(())
 }
 
-fn process_window_messages(window: &Window) -> Option<WindowMessages> {
-    if let Ok(x) = window.message_rx.try_recv() {
-        return Some(x);
+fn process_window_messages(window: &Window, should_block: bool) -> Option<WindowMessages> {
+    if should_block {
+        if let Ok(x) = window.message_rx.recv() {
+            return Some(x);
+        }
     }
+    else {
+        if let Ok(x) = window.message_rx.try_recv() {
+            return Some(x);
+        }
+    }    
     None
 }
 
@@ -298,8 +306,8 @@ impl GraphicsD3D11 {
                 Count: 1,
                 Quality: 0,
             },
-            //SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+            //SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
             OutputWindow: hwnd,
             Windowed: 1,
         };
@@ -458,9 +466,12 @@ fn main() {
 
     let mut is_resizing = false;
 
+    let mut should_block = true;
+
     while !should_exit {
         let mut should_draw = false;
-        while let Some(x) = process_window_messages(&main_window) {
+        if let Some(x) = process_window_messages(&main_window, should_block) {
+            should_block = false;
             match x {
                 WindowMessages::WindowClosed => {
                     should_exit = true;
@@ -513,10 +524,11 @@ fn main() {
                     panic!("unhandled windows message type");
                 }
             }
+        } else {
+            should_block = true;
         }
 
         if !should_draw {
-            std::thread::sleep(std::time::Duration::new(0, 1000));
             continue;
         }
 
@@ -572,9 +584,7 @@ fn main() {
         if frame_number == 0 {
             let init_time = Instant::now() - main_begin_time;
             println!("Init time: {}ms", init_time.as_secs_f32() * 1000.0);
-        }
-
-        let clear_color: [f32; 4] = [0.1, 0.2, 0.3, 1.0];
+        }        
 
         unsafe {
             let context = graphics.context.as_ref().unwrap();
@@ -607,6 +617,7 @@ fn main() {
             };
             context.RSSetViewports(1, &viewport);
 
+            let clear_color: [f32; 4] = [0.1, 0.2, 0.3, 1.0];
             context.ClearRenderTargetView(graphics.backbuffer_rtv, &clear_color);
 
             let cbvs: [*mut ID3D11Buffer; 1] = [graphics.constants];
