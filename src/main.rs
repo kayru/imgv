@@ -1,4 +1,4 @@
- #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
@@ -174,6 +174,13 @@ fn create_window() -> Result<Window, ()> {
                 screen_dim.1 / 2 - window_dim.1 / 2,
             );
 
+            let mut client_rect = winapi::shared::windef::RECT {
+                left: window_pos.0,
+                top: window_pos.1,
+                right: window_pos.0 + window_dim.0,
+                bottom: window_pos.1 + window_dim.1,
+            };
+
             let window_style = WS_CAPTION
                 | WS_MINIMIZEBOX
                 | WS_SYSMENU
@@ -181,13 +188,6 @@ fn create_window() -> Result<Window, ()> {
                 | WS_CLIPCHILDREN
                 | WS_SIZEBOX
                 | WS_MAXIMIZEBOX;
-
-            let mut client_rect = winapi::shared::windef::RECT {
-                left: window_pos.0,
-                top: window_pos.1,
-                right: window_pos.0 + window_dim.0,
-                bottom: window_pos.1 + window_dim.1,
-            };
 
             AdjustWindowRect(&mut client_rect, window_style, 0);
 
@@ -214,9 +214,9 @@ fn create_window() -> Result<Window, ()> {
             let mut msg: MSG = std::mem::zeroed();
 
             while !window_state.is_window_closed {
-                if GetMessageA(&mut msg, hwnd_window, 0, 0) > 0 {
+                if GetMessageW(&mut msg, hwnd_window, 0, 0) > 0 {
                     TranslateMessage(&msg);
-                    DispatchMessageA(&msg);
+                    DispatchMessageW(&msg);
                 }
             }
         }
@@ -237,12 +237,11 @@ fn process_window_messages(window: &Window, should_block: bool) -> Option<Window
         if let Ok(x) = window.message_rx.recv() {
             return Some(x);
         }
-    }
-    else {
+    } else {
         if let Ok(x) = window.message_rx.try_recv() {
             return Some(x);
         }
-    }    
+    }
     None
 }
 
@@ -257,6 +256,7 @@ struct GraphicsD3D11 {
     blit_vs: *mut ID3D11VertexShader,
     blit_ps: *mut ID3D11PixelShader,
     constants: *mut ID3D11Buffer,
+    smp_linear: *mut ID3D11SamplerState,
 }
 
 impl GraphicsD3D11 {
@@ -272,6 +272,7 @@ impl GraphicsD3D11 {
             blit_vs: null_mut(),
             blit_ps: null_mut(),
             constants: null_mut(),
+            smp_linear: null_mut(),
         };
 
         let adapter: *mut IDXGIAdapter = null_mut();
@@ -282,7 +283,9 @@ impl GraphicsD3D11 {
         #[cfg(not(debug_assertions))]
         let debug_device_flags = 0;
 
-        let device_flags: UINT = debug_device_flags;
+        let device_flags = debug_device_flags
+            | D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS
+            | D3D11_CREATE_DEVICE_SINGLETHREADED;
 
         let feature_levels: D3D_FEATURE_LEVEL = D3D_FEATURE_LEVEL_11_1;
         let num_feature_levels: UINT = 1;
@@ -306,8 +309,8 @@ impl GraphicsD3D11 {
                 Count: 1,
                 Quality: 0,
             },
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-            //SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            //SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
             OutputWindow: hwnd,
             Windowed: 1,
         };
@@ -375,6 +378,23 @@ impl GraphicsD3D11 {
                 StructureByteStride: std::mem::size_of::<Constants>() as u32,
             };
             let hr = device.CreateBuffer(&buffer_desc, std::ptr::null(), &mut result.constants);
+            assert!(hr == winapi::shared::winerror::S_OK);
+        }
+
+        {
+            let smp_desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_NEVER,
+                BorderColor: [1.0, 1.0, 1.0, 1.0],
+                MinLOD: -D3D11_FLOAT32_MAX,
+                MaxLOD: D3D11_FLOAT32_MAX,
+            };
+            let hr = device.CreateSamplerState(&smp_desc, &mut result.smp_linear);
             assert!(hr == winapi::shared::winerror::S_OK);
         }
 
@@ -468,6 +488,8 @@ fn main() {
 
     let mut should_block = true;
 
+    let mut pending_window_dim = float2 { x: 1.0, y: 1.0 };
+
     while !should_exit {
         let mut should_draw = false;
         if let Some(x) = process_window_messages(&main_window, should_block) {
@@ -482,7 +504,7 @@ fn main() {
                     match native_msg.msg {
                         WM_PAINT => {
                             should_draw = true;
-                        },
+                        }
                         WM_MOUSEMOVE => {
                             let mx = GET_X_LPARAM(l_param) as f32;
                             let my = GET_Y_LPARAM(l_param) as f32;
@@ -499,11 +521,12 @@ fn main() {
                         }
                         WM_SIZE => {
                             let width = winapi::shared::minwindef::LOWORD(l_param as u32);
-                            let height = winapi::shared::minwindef::LOWORD(l_param as u32);
-                            constants.window_dim.x = width as f32;
-                            constants.window_dim.y = height as f32;
+                            let height = winapi::shared::minwindef::HIWORD(l_param as u32);
+                            pending_window_dim.x = width as f32;
+                            pending_window_dim.y = height as f32;
                             if w_param == SIZE_MAXIMIZED || w_param == SIZE_RESTORED {
                                 if !is_resizing {
+                                    constants.window_dim = pending_window_dim.to_owned();
                                     unsafe { graphics.update_backbuffer(main_window.hwnd) };
                                 }
                             }
@@ -511,8 +534,9 @@ fn main() {
                         }
                         WM_ENTERSIZEMOVE => {
                             is_resizing = true;
-                        },
+                        }
                         WM_EXITSIZEMOVE => {
+                            constants.window_dim = pending_window_dim.to_owned();
                             unsafe { graphics.update_backbuffer(main_window.hwnd) };
                             should_draw = true;
                             is_resizing = false;
@@ -584,7 +608,7 @@ fn main() {
         if frame_number == 0 {
             let init_time = Instant::now() - main_begin_time;
             println!("Init time: {}ms", init_time.as_secs_f32() * 1000.0);
-        }        
+        }
 
         unsafe {
             let context = graphics.context.as_ref().unwrap();
@@ -622,6 +646,7 @@ fn main() {
 
             let cbvs: [*mut ID3D11Buffer; 1] = [graphics.constants];
             let srvs: [*mut ID3D11ShaderResourceView; 1] = [image_srv];
+            let samplers: [*mut ID3D11SamplerState; 1] = [graphics.smp_linear];
 
             context.PSSetConstantBuffers(0, cbvs.len() as u32, cbvs.as_ptr());
             context.VSSetConstantBuffers(0, cbvs.len() as u32, cbvs.as_ptr());
@@ -631,17 +656,14 @@ fn main() {
 
             context.VSSetShaderResources(0, srvs.len() as u32, srvs.as_ptr());
             context.PSSetShaderResources(0, srvs.len() as u32, srvs.as_ptr());
+            context.PSSetSamplers(0, samplers.len() as u32, samplers.as_ptr());
 
             context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             context.Draw(3, 0);
 
             context.ClearState();
-        
-            graphics
-            .swapchain
-            .as_ref()
-            .unwrap()
-            .Present(0, 0);
+
+            graphics.swapchain.as_ref().unwrap().Present(0, 0);
         };
 
         frame_number += 1;

@@ -1,4 +1,4 @@
-
+SamplerState smp_linear : register(s0);
 Texture2D image : register(t0);
 cbuffer Constants : register(b0) {
 	float2 image_dim;
@@ -24,5 +24,7 @@ float4 blit_ps(VSOut v) : SV_TARGET {
 	if (distance(v.pos.xy, mouse.xy) < 10) {
 		return float4(1,1,1,1);
 	}
-	return image.Load(int3(v.pos.xy, 0));
+	//return image.Load(int3(v.pos.xy, 0));
+	float2 uv = v.pos.xy / window_dim;
+	return image.SampleLevel(smp_linear, uv, 0);
 }
