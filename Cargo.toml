@@ -4,5 +4,20 @@ version = "0.1.0"
 authors = ["Yuriy O'Donnell <yuriyo@gmail.com>"]
 edition = "2018"
 
+[profile.dev.package.'*']
+opt-level = 3
+debug = true
+
 [dependencies]
-winapi = { version = "0.3", features = ["winuser", "d3d11", "winerror", "dxgi1_2"] }
+winapi = { version = "0.3.9", features = [
+    "d3d11", 
+    "d3d11sdklayers", 
+    "debugapi",
+    "dxgi1_2", 
+    "errhandlingapi",
+    "shellscalingapi",
+    "windowsx", 
+    "winerror", 
+    "winuser",
+    ]}
+image = "0.23.12"
