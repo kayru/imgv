@@ -456,8 +456,10 @@ fn main() {
     let mut image_tex: *mut ID3D11Texture2D = null_mut();
     let mut image_srv: *mut ID3D11ShaderResourceView = null_mut();
 
+    let mut is_resizing = false;
+
     while !should_exit {
-        let sync_interval = 1;
+        let mut should_draw = false;
         while let Some(x) = process_window_messages(&main_window) {
             match x {
                 WindowMessages::WindowClosed => {
@@ -467,27 +469,42 @@ fn main() {
                     let l_param = native_msg.l_param;
                     let w_param = native_msg.w_param;
                     match native_msg.msg {
+                        WM_PAINT => {
+                            should_draw = true;
+                        },
                         WM_MOUSEMOVE => {
                             let mx = GET_X_LPARAM(l_param) as f32;
                             let my = GET_Y_LPARAM(l_param) as f32;
                             constants.mouse.x = mx;
                             constants.mouse.y = my;
+                            should_draw = true;
                         }
                         WM_KEYDOWN => {
                             let key = w_param as i32;
                             if key == VK_ESCAPE {
                                 should_exit = true;
                             }
+                            should_draw = true;
                         }
                         WM_SIZE => {
                             let width = winapi::shared::minwindef::LOWORD(l_param as u32);
                             let height = winapi::shared::minwindef::LOWORD(l_param as u32);
                             constants.window_dim.x = width as f32;
                             constants.window_dim.y = height as f32;
-                            unsafe { graphics.update_backbuffer(main_window.hwnd) };
+                            if w_param == SIZE_MAXIMIZED || w_param == SIZE_RESTORED {
+                                if !is_resizing {
+                                    unsafe { graphics.update_backbuffer(main_window.hwnd) };
+                                }
+                            }
+                            should_draw = true;
                         }
+                        WM_ENTERSIZEMOVE => {
+                            is_resizing = true;
+                        },
                         WM_EXITSIZEMOVE => {
-                            // unsafe { graphics.update_backbuffer(main_window.hwnd) };
+                            unsafe { graphics.update_backbuffer(main_window.hwnd) };
+                            should_draw = true;
+                            is_resizing = false;
                         }
                         _ => {}
                     }
@@ -496,6 +513,11 @@ fn main() {
                     panic!("unhandled windows message type");
                 }
             }
+        }
+
+        if !should_draw {
+            std::thread::sleep(std::time::Duration::new(0, 1000));
+            continue;
         }
 
         let device = unsafe { graphics.device.as_ref().unwrap() };
@@ -603,12 +625,12 @@ fn main() {
             context.Draw(3, 0);
 
             context.ClearState();
-
+        
             graphics
-                .swapchain
-                .as_ref()
-                .unwrap()
-                .Present(sync_interval, 0);
+            .swapchain
+            .as_ref()
+            .unwrap()
+            .Present(0, 0);
         };
 
         frame_number += 1;
