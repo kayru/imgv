@@ -284,8 +284,7 @@ impl GraphicsD3D11 {
         let debug_device_flags = 0;
 
         let device_flags = debug_device_flags
-            | D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS
-            | D3D11_CREATE_DEVICE_SINGLETHREADED;
+            | D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS;
 
         let feature_levels: D3D_FEATURE_LEVEL = D3D_FEATURE_LEVEL_11_1;
         let num_feature_levels: UINT = 1;
@@ -309,8 +308,8 @@ impl GraphicsD3D11 {
                 Count: 1,
                 Quality: 0,
             },
-            //SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+            //SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
             OutputWindow: hwnd,
             Windowed: 1,
         };
@@ -371,9 +370,9 @@ impl GraphicsD3D11 {
         {
             let buffer_desc = D3D11_BUFFER_DESC {
                 ByteWidth: std::mem::size_of::<Constants>() as u32,
-                Usage: D3D11_USAGE_DYNAMIC,
+                Usage: D3D11_USAGE_DEFAULT,
                 BindFlags: D3D11_BIND_CONSTANT_BUFFER,
-                CPUAccessFlags: D3D11_CPU_ACCESS_WRITE,
+                CPUAccessFlags: 0,
                 MiscFlags: 0,
                 StructureByteStride: std::mem::size_of::<Constants>() as u32,
             };
@@ -613,20 +612,14 @@ fn main() {
         unsafe {
             let context = graphics.context.as_ref().unwrap();
 
-            let mut mapped_resource = D3D11_MAPPED_SUBRESOURCE {
-                pData: null_mut(),
-                RowPitch: 0,
-                DepthPitch: 0,
-            };
-            context.Map(
-                graphics.constants as *mut ID3D11Resource,
+            context.UpdateSubresource(
+                graphics.constants as _,
                 0,
-                D3D11_MAP_WRITE_DISCARD,
+                null_mut(),
+                &constants as *const Constants as _,
                 0,
-                &mut mapped_resource,
+                0,
             );
-            std::ptr::write(mapped_resource.pData as *mut Constants, constants.clone());
-            context.Unmap(graphics.constants as *mut ID3D11Resource, 0);
 
             let rtvs: [*mut ID3D11RenderTargetView; 1] = [graphics.backbuffer_rtv];
             context.OMSetRenderTargets(1, rtvs.as_ptr(), null_mut());
