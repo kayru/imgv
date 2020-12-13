@@ -66,6 +66,7 @@ unsafe impl std::marker::Send for WindowCreatedData {}
 struct Window {
     message_rx: std::sync::mpsc::Receiver<WindowMessages>,
     hwnd: HWND,
+    window_style: u32,
 }
 
 struct WindowThreadState {
@@ -73,19 +74,32 @@ struct WindowThreadState {
     is_window_closed: bool,
 }
 
-unsafe fn get_window_client_rect_dimensions(hwnd: HWND) -> (u32, u32) {
+fn get_window_client_rect_dimensions(hwnd: HWND) -> (u32, u32) {
     let mut client_rect = winapi::shared::windef::RECT {
         left: 0,
         right: 0,
         top: 0,
         bottom: 0,
     };
-    GetClientRect(hwnd, &mut client_rect);
+    unsafe {
+        GetClientRect(hwnd, &mut client_rect);
+    }
     let dimensions = (
         (client_rect.right - client_rect.left) as u32,
         (client_rect.bottom - client_rect.top) as u32,
     );
     dimensions
+}
+
+fn compute_client_rect(dim: (i32, i32)) -> winapi::shared::windef::RECT {
+    let screen_dim = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    let window_pos = (screen_dim.0 / 2 - dim.0 / 2, screen_dim.1 / 2 - dim.1 / 2);
+    winapi::shared::windef::RECT {
+        left: window_pos.0,
+        top: window_pos.1,
+        right: window_pos.0 + dim.0,
+        bottom: window_pos.1 + dim.1,
+    }
 }
 
 unsafe extern "system" fn window_proc(
@@ -135,101 +149,108 @@ unsafe extern "system" fn window_proc(
     DefWindowProcW(hwnd, msg, w_param, l_param)
 }
 
-fn create_window() -> Result<Window, ()> {
-    let (channel_sender, channel_receiver) = std::sync::mpsc::channel();
+impl Window {
+    fn new(window_dim: (i32, i32)) -> Result<Window, ()> {
+        let (channel_sender, channel_receiver) = std::sync::mpsc::channel();
 
-    std::thread::spawn(move || {
-        let mut window_state = WindowThreadState {
-            message_tx: channel_sender,
-            is_window_closed: false,
-        };
+        let window_style: u32 = WS_CAPTION
+            | WS_MINIMIZEBOX
+            | WS_SYSMENU
+            | WS_CLIPSIBLINGS
+            | WS_CLIPCHILDREN
+            | WS_SIZEBOX
+            | WS_MAXIMIZEBOX;
 
-        unsafe {
-            let window_name: Vec<u16> = OsStr::new("imgv\0").encode_wide().collect();
-
-            let window_class_name: Vec<u16> =
-                OsStr::new("imgv_window_class\0").encode_wide().collect();
-
-            let window_class = WNDCLASSW {
-                style: 0, //CS_DBLCLKS | CS_OWNDC | CS_HREDRAW | CS_VREDRAW,
-                lpfnWndProc: Some(window_proc),
-                cbClsExtra: 0,
-                cbWndExtra: 0,
-                hInstance: 0 as HINSTANCE,
-                hIcon: 0 as HICON,
-                hCursor: LoadCursorW(null_mut(), IDC_ARROW) as HICON,
-                hbrBackground: 16 as HBRUSH,
-                lpszMenuName: 0 as LPCWSTR,
-                lpszClassName: window_class_name.as_ptr(),
+        std::thread::spawn(move || {
+            let mut window_state = WindowThreadState {
+                message_tx: channel_sender,
+                is_window_closed: false,
             };
 
-            let error_code = RegisterClassW(&window_class);
+            unsafe {
+                let window_name: Vec<u16> = OsStr::new("imgv\0").encode_wide().collect();
 
-            assert!(error_code != 0, "failed to register the window class");
+                let window_class_name: Vec<u16> =
+                    OsStr::new("imgv_window_class\0").encode_wide().collect();
 
-            let window_dim = (500, 500);
-            let screen_dim = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-            let window_pos = (
-                screen_dim.0 / 2 - window_dim.0 / 2,
-                screen_dim.1 / 2 - window_dim.1 / 2,
-            );
+                let window_class = WNDCLASSW {
+                    style: 0, //CS_DBLCLKS | CS_OWNDC | CS_HREDRAW | CS_VREDRAW,
+                    lpfnWndProc: Some(window_proc),
+                    cbClsExtra: 0,
+                    cbWndExtra: 0,
+                    hInstance: 0 as HINSTANCE,
+                    hIcon: 0 as HICON,
+                    hCursor: LoadCursorW(null_mut(), IDC_ARROW) as HICON,
+                    hbrBackground: 16 as HBRUSH,
+                    lpszMenuName: 0 as LPCWSTR,
+                    lpszClassName: window_class_name.as_ptr(),
+                };
 
-            let mut client_rect = winapi::shared::windef::RECT {
-                left: window_pos.0,
-                top: window_pos.1,
-                right: window_pos.0 + window_dim.0,
-                bottom: window_pos.1 + window_dim.1,
-            };
+                let error_code = RegisterClassW(&window_class);
 
-            let window_style = WS_CAPTION
-                | WS_MINIMIZEBOX
-                | WS_SYSMENU
-                | WS_CLIPSIBLINGS
-                | WS_CLIPCHILDREN
-                | WS_SIZEBOX
-                | WS_MAXIMIZEBOX;
+                assert!(error_code != 0, "failed to register the window class");
 
-            AdjustWindowRect(&mut client_rect, window_style, 0);
+                let mut client_rect = compute_client_rect(window_dim);
 
-            let hwnd_window = CreateWindowExW(
-                0,
-                window_class_name.as_ptr(),
-                window_name.as_ptr(),
-                window_style,
-                client_rect.left,
-                client_rect.top,
-                client_rect.right - client_rect.left,
-                client_rect.bottom - client_rect.top,
-                0 as HWND,
-                0 as HMENU,
-                0 as HINSTANCE,
-                &mut window_state as *mut WindowThreadState as *mut c_void,
-            );
+                AdjustWindowRect(&mut client_rect, window_style, 0);
 
-            assert!(hwnd_window != (0 as HWND), "failed to open the window");
+                let hwnd_window = CreateWindowExW(
+                    0,
+                    window_class_name.as_ptr(),
+                    window_name.as_ptr(),
+                    window_style,
+                    client_rect.left,
+                    client_rect.top,
+                    client_rect.right - client_rect.left,
+                    client_rect.bottom - client_rect.top,
+                    0 as HWND,
+                    0 as HMENU,
+                    0 as HINSTANCE,
+                    &mut window_state as *mut WindowThreadState as _,
+                );
 
-            // Delay showing this window until D3D is ready to draw something
-            // ShowWindow(hwnd_window, SW_SHOW);
+                assert!(hwnd_window != (0 as HWND), "failed to open the window");
 
-            let mut msg: MSG = std::mem::zeroed();
+                // Delay showing this window until D3D is ready to draw something
+                // ShowWindow(hwnd_window, SW_SHOW);
 
-            while !window_state.is_window_closed {
-                if GetMessageW(&mut msg, hwnd_window, 0, 0) > 0 {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
+                let mut msg: MSG = std::mem::zeroed();
+
+                while !window_state.is_window_closed {
+                    if GetMessageW(&mut msg, hwnd_window, 0, 0) > 0 {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
                 }
             }
-        }
-    });
-
-    if let WindowMessages::WindowCreated(data) = channel_receiver.recv().unwrap() {
-        return Ok(Window {
-            message_rx: channel_receiver,
-            hwnd: data.hwnd,
         });
+
+        if let WindowMessages::WindowCreated(data) = channel_receiver.recv().unwrap() {
+            return Ok(Window {
+                message_rx: channel_receiver,
+                hwnd: data.hwnd,
+                window_style,
+            });
+        }
+
+        Err(())
     }
 
-    Err(())
+    pub fn set_image_size(&mut self, dim: (i32, i32)) {
+        let mut rect = compute_client_rect(dim);
+        unsafe {
+            AdjustWindowRect(&mut rect, self.window_style, 0);
+            SetWindowPos(
+                self.hwnd,
+                null_mut(),
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                0,
+            );
+        }
+    }
 }
 
 fn process_window_messages(window: &Window, should_block: bool) -> Option<WindowMessages> {
@@ -283,8 +304,8 @@ impl GraphicsD3D11 {
         #[cfg(not(debug_assertions))]
         let debug_device_flags = 0;
 
-        let device_flags = debug_device_flags
-            | D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS;
+        let device_flags =
+            debug_device_flags | D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS;
 
         let feature_levels: D3D_FEATURE_LEVEL = D3D_FEATURE_LEVEL_11_1;
         let num_feature_levels: UINT = 1;
@@ -450,7 +471,7 @@ fn main() {
         let _ = image_tx.send(img);
     });
 
-    let main_window: Window = create_window().unwrap();
+    let mut main_window: Window = Window::new((500, 500)).unwrap();
 
     {
         let window_time = Instant::now() - main_begin_time;
@@ -599,6 +620,7 @@ fn main() {
                     image_load_time.as_secs_f32() * 1000.0,
                     dim
                 );
+                main_window.set_image_size((dim.0 as i32, dim.1 as i32));
             } else {
                 println!("Failed to load image");
             };
