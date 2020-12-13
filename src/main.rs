@@ -20,6 +20,8 @@ use winapi::um::winuser::*;
 use winapi::Interface;
 //use std::time::{Duration};
 
+const NUM_BACK_BUFFERS: u32 = 2;
+
 #[repr(C)]
 #[derive(Clone)]
 struct float2 {
@@ -322,7 +324,7 @@ impl GraphicsD3D11 {
                 Scaling: DXGI_MODE_SCALING_UNSPECIFIED,
                 ScanlineOrdering: DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED,
             },
-            BufferCount: 2,
+            BufferCount: NUM_BACK_BUFFERS,
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             Flags: 0,
             SampleDesc: DXGI_SAMPLE_DESC {
@@ -438,8 +440,13 @@ impl GraphicsD3D11 {
                 self.backbuffer_rtv.as_ref().unwrap().Release();
             }
 
-            let hr: HRESULT =
-                swapchain.ResizeBuffers(2, new_dim.0, new_dim.1, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+            let hr: HRESULT = swapchain.ResizeBuffers(
+                NUM_BACK_BUFFERS,
+                new_dim.0,
+                new_dim.1,
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                0,
+            );
             assert!(hr == winapi::shared::winerror::S_OK);
 
             self.swapchain.as_ref().unwrap().GetBuffer(
