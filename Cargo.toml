@@ -15,11 +15,12 @@ winapi = { version = "0.3.9", features = [
     "debugapi",
     "dxgi1_2", 
     "errhandlingapi",
+    "libloaderapi",
+    "shellapi",
     "shellscalingapi",
     "windowsx", 
     "winerror", 
     "winuser",
-    "libloaderapi",
     ]}
 image = "0.23.12"
 

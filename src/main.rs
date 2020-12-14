@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::prelude::*;
 use std::ptr::null_mut;
 use std::time::Instant;
 use winapi::ctypes::c_void;
@@ -21,6 +23,8 @@ use winapi::Interface;
 //use std::time::{Duration};
 
 const NUM_BACK_BUFFERS: u32 = 2;
+const WINDOW_MIN_WIDTH: i32 = 200;
+const WINDOW_MIN_HEIGHT: i32 = 150;
 
 #[repr(C)]
 #[derive(Clone)]
@@ -53,8 +57,8 @@ struct WindowCreatedData {
 
 struct NativeMessageData {
     msg: UINT,
-    w_param: WPARAM,
-    l_param: LPARAM,
+    wparam: WPARAM,
+    lparam: LPARAM,
 }
 
 enum WindowMessages {
@@ -107,12 +111,12 @@ fn compute_client_rect(dim: (i32, i32)) -> winapi::shared::windef::RECT {
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     msg: UINT,
-    w_param: WPARAM,
-    l_param: LPARAM,
+    wparam: WPARAM,
+    lparam: LPARAM,
 ) -> LRESULT {
     match msg {
         WM_CREATE => {
-            let create_struct = l_param as *mut winapi::um::winuser::CREATESTRUCTW;
+            let create_struct = lparam as *mut winapi::um::winuser::CREATESTRUCTW;
             let window_state_ptr =
                 create_struct.as_ref().unwrap().lpCreateParams as *mut WindowThreadState;
             let window_state: &mut WindowThreadState = window_state_ptr.as_mut().unwrap();
@@ -140,28 +144,23 @@ unsafe extern "system" fn window_proc(
                     .message_tx
                     .send(WindowMessages::NativeMessage(NativeMessageData {
                         msg,
-                        w_param,
-                        l_param,
+                        wparam,
+                        lparam,
                     }))
                     .unwrap();
             }
         }
     };
 
-    DefWindowProcW(hwnd, msg, w_param, l_param)
+    DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
 impl Window {
     fn new(window_dim: (i32, i32)) -> Result<Window, ()> {
         let (channel_sender, channel_receiver) = std::sync::mpsc::channel();
 
-        let window_style: u32 = WS_CAPTION
-            | WS_MINIMIZEBOX
-            | WS_SYSMENU
-            | WS_CLIPSIBLINGS
-            | WS_CLIPCHILDREN
-            | WS_SIZEBOX
-            | WS_MAXIMIZEBOX;
+        let window_style: u32 =
+            WS_MAXIMIZEBOX | WS_MINIMIZEBOX | WS_SYSMENU | WS_SIZEBOX | WS_CAPTION;
 
         std::thread::Builder::new()
             .name("window".to_owned())
@@ -202,7 +201,7 @@ impl Window {
 
                     AdjustWindowRect(&mut client_rect, window_style, 0);
 
-                    let hwnd_window = CreateWindowExW(
+                    let hwnd = CreateWindowExW(
                         0,
                         window_class_name.as_ptr(),
                         window_name.as_ptr(),
@@ -216,15 +215,17 @@ impl Window {
                         hinst,
                         &mut window_state as *mut WindowThreadState as _,
                     );
-                    assert!(hwnd_window != (0 as HWND), "failed to open the window");
+                    assert!(hwnd != (0 as HWND), "failed to open the window");
+
+                    winapi::um::shellapi::DragAcceptFiles(hwnd, 1);
 
                     // Delay showing this window until D3D is ready to draw something
-                    // ShowWindow(hwnd_window, SW_SHOW);
+                    // ShowWindow(hwnd, SW_SHOW);
 
                     let mut msg: MSG = std::mem::zeroed();
 
                     while !window_state.is_window_closed {
-                        if GetMessageW(&mut msg, hwnd_window, 0, 0) > 0 {
+                        if GetMessageW(&mut msg, hwnd, 0, 0) > 0 {
                             TranslateMessage(&msg);
                             DispatchMessageW(&msg);
                         }
@@ -471,14 +472,28 @@ fn main() {
 
     unsafe { SetProcessDpiAwareness(1) };
 
+    let (load_req_tx, load_req_rx) = std::sync::mpsc::channel();
     let (image_tx, image_rx) = std::sync::mpsc::channel();
 
-    std::thread::spawn(move || {
-        let img = image::open("c:/temp/test.png");
-        let _ = image_tx.send(img);
-    });
+    if std::env::args().len() > 1 {
+        let args: Vec<String> = std::env::args().collect();
+        let filename: OsString = args[1].clone().into();
+        let _ = load_req_tx.send(filename);
+    }
 
     let mut main_window: Window = Window::new((500, 500)).unwrap();
+    let main_window_handle = main_window.hwnd as u64;
+    std::thread::spawn(move || {
+        while let Ok(x) = load_req_rx.recv() {
+            println!("Loading image {:?}", x);
+            let img = image::open(x);
+            let _ = image_tx.send(img);
+            unsafe {
+                InvalidateRect(main_window_handle as HWND, null_mut(), 1);
+            }
+        }
+        println!("Loading thread done");
+    });
 
     {
         let window_time = Instant::now() - main_begin_time;
@@ -526,32 +541,44 @@ fn main() {
                     should_exit = true;
                 }
                 WindowMessages::NativeMessage(native_msg) => {
-                    let l_param = native_msg.l_param;
-                    let w_param = native_msg.w_param;
+                    let lparam = native_msg.lparam;
+                    let wparam = native_msg.wparam;
                     match native_msg.msg {
+                        WM_GETMINMAXINFO => unsafe {
+                            if let Some(mmi) = (lparam as LPMINMAXINFO).as_mut(){
+                                mmi.ptMinTrackSize.x = WINDOW_MIN_WIDTH;
+                                mmi.ptMinTrackSize.y = WINDOW_MIN_HEIGHT;
+                            }
+                        }
                         WM_PAINT => {
                             should_draw = true;
                         }
+                        WM_MOUSEWHEEL => {
+                            let _mx = GET_X_LPARAM(lparam) as f32;
+                            let _my = GET_Y_LPARAM(lparam) as f32;
+                            let zdelta = GET_WHEEL_DELTA_WPARAM(wparam);
+                            println!("zdelta: {}", zdelta);
+                        }
                         WM_MOUSEMOVE => {
-                            let mx = GET_X_LPARAM(l_param) as f32;
-                            let my = GET_Y_LPARAM(l_param) as f32;
+                            let mx = GET_X_LPARAM(lparam) as f32;
+                            let my = GET_Y_LPARAM(lparam) as f32;
                             constants.mouse.x = mx;
                             constants.mouse.y = my;
                             should_draw = true;
                         }
                         WM_KEYDOWN => {
-                            let key = w_param as i32;
+                            let key = wparam as i32;
                             if key == VK_ESCAPE {
                                 should_exit = true;
                             }
                             should_draw = true;
                         }
                         WM_SIZE => {
-                            let width = winapi::shared::minwindef::LOWORD(l_param as u32);
-                            let height = winapi::shared::minwindef::HIWORD(l_param as u32);
+                            let width = winapi::shared::minwindef::LOWORD(lparam as u32);
+                            let height = winapi::shared::minwindef::HIWORD(lparam as u32);
                             pending_window_dim.x = width as f32;
                             pending_window_dim.y = height as f32;
-                            if w_param == SIZE_MAXIMIZED || w_param == SIZE_RESTORED {
+                            if wparam == SIZE_MAXIMIZED || wparam == SIZE_RESTORED {
                                 if !is_resizing {
                                     constants.window_dim = pending_window_dim.to_owned();
                                     unsafe { graphics.update_backbuffer(main_window.hwnd) };
@@ -567,6 +594,28 @@ fn main() {
                             unsafe { graphics.update_backbuffer(main_window.hwnd) };
                             should_draw = true;
                             is_resizing = false;
+                        }
+                        WM_DROPFILES => {
+                            use winapi::um::shellapi::*;
+                            let hdrop = wparam as HDROP;
+                            unsafe {
+                                let filename_len = DragQueryFileW(hdrop, 0, null_mut(), 0) as usize;
+                                if filename_len > 0 {
+                                    let mut filename_bytes =
+                                        Vec::<u16>::with_capacity(filename_len + 1);
+                                    filename_bytes.set_len(filename_len + 1);
+                                    DragQueryFileW(
+                                        hdrop,
+                                        0,
+                                        filename_bytes.as_mut_ptr(),
+                                        filename_bytes.len() as u32,
+                                    );
+                                    filename_bytes.set_len(filename_bytes.len() - 1);
+                                    let filename = OsString::from_wide(&filename_bytes);
+                                    let _ = load_req_tx.send(filename);
+                                }
+                                DragFinish(hdrop);
+                            }
                         }
                         _ => {}
                     }
