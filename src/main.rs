@@ -8,7 +8,7 @@ use winapi::ctypes::c_void;
 use winapi::shared::dxgi::*;
 use winapi::shared::dxgiformat::*;
 use winapi::shared::dxgitype::*;
-use winapi::shared::minwindef::{HINSTANCE, LPARAM, LRESULT, UINT, WPARAM};
+use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::ntdef::{HRESULT, LPCWSTR};
 use winapi::shared::windef::{HBRUSH, HICON, HMENU, HWND};
 use winapi::shared::windowsx::{GET_X_LPARAM, GET_Y_LPARAM};
@@ -163,69 +163,75 @@ impl Window {
             | WS_SIZEBOX
             | WS_MAXIMIZEBOX;
 
-        std::thread::spawn(move || {
-            let mut window_state = WindowThreadState {
-                message_tx: channel_sender,
-                is_window_closed: false,
-            };
-
-            unsafe {
-                let window_name: Vec<u16> = OsStr::new("imgv\0").encode_wide().collect();
-
-                let window_class_name: Vec<u16> =
-                    OsStr::new("imgv_window_class\0").encode_wide().collect();
-
-                let window_class = WNDCLASSW {
-                    style: 0, //CS_DBLCLKS | CS_OWNDC | CS_HREDRAW | CS_VREDRAW,
-                    lpfnWndProc: Some(window_proc),
-                    cbClsExtra: 0,
-                    cbWndExtra: 0,
-                    hInstance: 0 as HINSTANCE,
-                    hIcon: 0 as HICON,
-                    hCursor: LoadCursorW(null_mut(), IDC_ARROW) as HICON,
-                    hbrBackground: 16 as HBRUSH,
-                    lpszMenuName: 0 as LPCWSTR,
-                    lpszClassName: window_class_name.as_ptr(),
+        std::thread::Builder::new()
+            .name("window".to_owned())
+            .spawn(move || {
+                let mut window_state = WindowThreadState {
+                    message_tx: channel_sender,
+                    is_window_closed: false,
                 };
 
-                let error_code = RegisterClassW(&window_class);
+                unsafe {
+                    let window_name: Vec<u16> = OsStr::new("imgv\0").encode_wide().collect();
+                    let icon_name: Vec<u16> = OsStr::new("imgv\0").encode_wide().collect();
+                    let window_class_name: Vec<u16> =
+                        OsStr::new("imgv_window_class\0").encode_wide().collect();
 
-                assert!(error_code != 0, "failed to register the window class");
+                    let hinst = winapi::um::libloaderapi::GetModuleHandleW(null_mut());
+                    let hicon: HICON = LoadIconW(hinst, icon_name.as_ptr());
+                    assert!(hicon != (0 as HICON), "failed to load icon");
 
-                let mut client_rect = compute_client_rect(window_dim);
+                    let window_class = WNDCLASSW {
+                        style: 0, //CS_DBLCLKS | CS_OWNDC | CS_HREDRAW | CS_VREDRAW,
+                        lpfnWndProc: Some(window_proc),
+                        cbClsExtra: 0,
+                        cbWndExtra: 0,
+                        hInstance: hinst,
+                        hIcon: hicon,
+                        hCursor: LoadCursorW(null_mut(), IDC_ARROW) as HICON,
+                        hbrBackground: 16 as HBRUSH,
+                        lpszMenuName: 0 as LPCWSTR,
+                        lpszClassName: window_class_name.as_ptr(),
+                    };
 
-                AdjustWindowRect(&mut client_rect, window_style, 0);
+                    let error_code = RegisterClassW(&window_class);
 
-                let hwnd_window = CreateWindowExW(
-                    0,
-                    window_class_name.as_ptr(),
-                    window_name.as_ptr(),
-                    window_style,
-                    client_rect.left,
-                    client_rect.top,
-                    client_rect.right - client_rect.left,
-                    client_rect.bottom - client_rect.top,
-                    0 as HWND,
-                    0 as HMENU,
-                    0 as HINSTANCE,
-                    &mut window_state as *mut WindowThreadState as _,
-                );
+                    assert!(error_code != 0, "failed to register the window class");
 
-                assert!(hwnd_window != (0 as HWND), "failed to open the window");
+                    let mut client_rect = compute_client_rect(window_dim);
 
-                // Delay showing this window until D3D is ready to draw something
-                // ShowWindow(hwnd_window, SW_SHOW);
+                    AdjustWindowRect(&mut client_rect, window_style, 0);
 
-                let mut msg: MSG = std::mem::zeroed();
+                    let hwnd_window = CreateWindowExW(
+                        0,
+                        window_class_name.as_ptr(),
+                        window_name.as_ptr(),
+                        window_style,
+                        client_rect.left,
+                        client_rect.top,
+                        client_rect.right - client_rect.left,
+                        client_rect.bottom - client_rect.top,
+                        0 as HWND,
+                        0 as HMENU,
+                        hinst,
+                        &mut window_state as *mut WindowThreadState as _,
+                    );
+                    assert!(hwnd_window != (0 as HWND), "failed to open the window");
 
-                while !window_state.is_window_closed {
-                    if GetMessageW(&mut msg, hwnd_window, 0, 0) > 0 {
-                        TranslateMessage(&msg);
-                        DispatchMessageW(&msg);
+                    // Delay showing this window until D3D is ready to draw something
+                    // ShowWindow(hwnd_window, SW_SHOW);
+
+                    let mut msg: MSG = std::mem::zeroed();
+
+                    while !window_state.is_window_closed {
+                        if GetMessageW(&mut msg, hwnd_window, 0, 0) > 0 {
+                            TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
                     }
                 }
-            }
-        });
+            })
+            .unwrap();
 
         if let WindowMessages::WindowCreated(data) = channel_receiver.recv().unwrap() {
             return Ok(Window {
@@ -300,14 +306,9 @@ impl GraphicsD3D11 {
 
         let adapter: *mut IDXGIAdapter = null_mut();
 
-        #[cfg(debug_assertions)]
-        let debug_device_flags = D3D11_CREATE_DEVICE_DEBUG;
-
-        #[cfg(not(debug_assertions))]
-        let debug_device_flags = 0;
-
-        let device_flags =
-            debug_device_flags | D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS;
+        let device_flags = D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS | {
+            D3D11_CREATE_DEVICE_DEBUG * cfg!(debug_assertions) as u32
+        };
 
         let feature_levels: D3D_FEATURE_LEVEL = D3D_FEATURE_LEVEL_11_1;
         let num_feature_levels: UINT = 1;
@@ -331,8 +332,7 @@ impl GraphicsD3D11 {
                 Count: 1,
                 Quality: 0,
             },
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-            //SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
             OutputWindow: hwnd,
             Windowed: 1,
         };
