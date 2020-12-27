@@ -21,26 +21,20 @@ use winapi::um::shellscalingapi::SetProcessDpiAwareness;
 use winapi::um::winuser::*;
 use winapi::Interface;
 //use std::time::{Duration};
+use cgmath::prelude::*;
 
 const NUM_BACK_BUFFERS: u32 = 2;
 const WINDOW_MIN_WIDTH: i32 = 200;
 const WINDOW_MIN_HEIGHT: i32 = 150;
 
-#[repr(C)]
-#[derive(Clone)]
-struct float2 {
-    x: f32,
-    y: f32,
-}
+#[allow(non_camel_case_types)]
+type float2 = cgmath::Vector2<f32>;
 
-#[repr(C)]
-#[derive(Clone)]
-struct float4 {
-    x: f32,
-    y: f32,
-    z: f32,
-    w: f32,
-}
+#[allow(non_camel_case_types)]
+type float4 = cgmath::Vector4<f32>;
+
+const FLOAT2_ONE: float2 = float2::new(1.0, 1.0);
+const FLOAT2_ZERO: float2 = float2::new(0.0, 0.0);
 
 // TODO: can we generate this based on shader reflection or inject into shader code from rust?
 #[repr(C)]
@@ -49,6 +43,8 @@ struct Constants {
     image_dim: float2,
     window_dim: float2,
     mouse: float4, // float2 xy pos, uint buttons, uint unused
+    uv_scale: float2,
+    uv_bias: float2,
 }
 
 struct WindowCreatedData {
@@ -287,6 +283,7 @@ struct GraphicsD3D11 {
     blit_ps: *mut ID3D11PixelShader,
     constants: *mut ID3D11Buffer,
     smp_linear: *mut ID3D11SamplerState,
+    smp_point: *mut ID3D11SamplerState,
 }
 
 impl GraphicsD3D11 {
@@ -303,6 +300,7 @@ impl GraphicsD3D11 {
             blit_ps: null_mut(),
             constants: null_mut(),
             smp_linear: null_mut(),
+            smp_point: null_mut(),
         };
 
         let adapter: *mut IDXGIAdapter = null_mut();
@@ -405,7 +403,7 @@ impl GraphicsD3D11 {
         }
 
         {
-            let smp_desc = D3D11_SAMPLER_DESC {
+            let smp_desc_base = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
                 AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
                 AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
@@ -417,8 +415,19 @@ impl GraphicsD3D11 {
                 MinLOD: -D3D11_FLOAT32_MAX,
                 MaxLOD: D3D11_FLOAT32_MAX,
             };
-            let hr = device.CreateSamplerState(&smp_desc, &mut result.smp_linear);
-            assert!(hr == winapi::shared::winerror::S_OK);
+
+            {
+                let smp_desc = smp_desc_base.clone();
+                let hr = device.CreateSamplerState(&smp_desc, &mut result.smp_linear);
+                assert!(hr == winapi::shared::winerror::S_OK);
+            }
+
+            {
+                let mut smp_desc = smp_desc_base.clone();
+                smp_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+                let hr = device.CreateSamplerState(&smp_desc, &mut result.smp_point);
+                assert!(hr == winapi::shared::winerror::S_OK);
+            }
         }
 
         result.update_backbuffer(hwnd);
@@ -467,6 +476,12 @@ impl GraphicsD3D11 {
     }
 }
 
+fn decode_mouse_pos(lparam: isize) -> float2 {
+    let x = GET_X_LPARAM(lparam) as f32;
+    let y = GET_Y_LPARAM(lparam) as f32;
+    float2 { x, y }
+}
+
 fn main() {
     let main_begin_time = Instant::now();
 
@@ -513,24 +528,28 @@ fn main() {
     let mut frame_number = 0;
 
     let mut constants = Constants {
-        image_dim: float2 { x: 0.0, y: 0.0 },
-        window_dim: float2 { x: 0.0, y: 0.0 },
+        image_dim: FLOAT2_ZERO,
+        window_dim: FLOAT2_ZERO,
         mouse: float4 {
             x: 0.0,
             y: 0.0,
             z: 0.0,
             w: 0.0,
         },
+        uv_scale: FLOAT2_ONE,
+        uv_bias: FLOAT2_ZERO,
     };
 
     let mut image_tex: *mut ID3D11Texture2D = null_mut();
     let mut image_srv: *mut ID3D11ShaderResourceView = null_mut();
-
     let mut is_resizing = false;
-
     let mut should_block = true;
-
-    let mut pending_window_dim = float2 { x: 1.0, y: 1.0 };
+    let mut pending_window_dim = FLOAT2_ONE;
+    let mut is_dragging = false;
+    let mut drag_origin = FLOAT2_ZERO;
+    let mut image_zoom: f32 = 1.0;
+    let mut image_offset = FLOAT2_ZERO;
+    let mut mouse_pos = FLOAT2_ZERO;
 
     while !should_exit {
         let mut should_draw = false;
@@ -545,31 +564,71 @@ fn main() {
                     let wparam = native_msg.wparam;
                     match native_msg.msg {
                         WM_GETMINMAXINFO => unsafe {
-                            if let Some(mmi) = (lparam as LPMINMAXINFO).as_mut(){
+                            if let Some(mmi) = (lparam as LPMINMAXINFO).as_mut() {
                                 mmi.ptMinTrackSize.x = WINDOW_MIN_WIDTH;
                                 mmi.ptMinTrackSize.y = WINDOW_MIN_HEIGHT;
                             }
-                        }
+                        },
                         WM_PAINT => {
                             should_draw = true;
                         }
                         WM_MOUSEWHEEL => {
-                            let _mx = GET_X_LPARAM(lparam) as f32;
-                            let _my = GET_Y_LPARAM(lparam) as f32;
-                            let zdelta = GET_WHEEL_DELTA_WPARAM(wparam);
-                            println!("zdelta: {}", zdelta);
+                            let scroll_delta = GET_WHEEL_DELTA_WPARAM(wparam);
+                            let zoom_delta = (-scroll_delta as f32 / 120.0) * image_zoom * 0.1;
+                            should_draw = true;
+                            println!(
+                                "zdelta: {}, zoom: {}, mpos: {:?}, offset: {:?}",
+                                zoom_delta, image_zoom, mouse_pos, image_offset
+                            );
+                            image_zoom += zoom_delta;
+                        }
+                        WM_LBUTTONDOWN => {
+                            is_dragging = true;
+                            drag_origin = image_offset + mouse_pos;
+                        }
+                        WM_LBUTTONUP => {
+                            is_dragging = false;
                         }
                         WM_MOUSEMOVE => {
-                            let mx = GET_X_LPARAM(lparam) as f32;
-                            let my = GET_Y_LPARAM(lparam) as f32;
-                            constants.mouse.x = mx;
-                            constants.mouse.y = my;
+                            mouse_pos = decode_mouse_pos(lparam);
+                            constants.mouse.x = mouse_pos.x;
+                            constants.mouse.y = mouse_pos.y;
+                            if is_dragging {
+                                image_offset = drag_origin - mouse_pos;
+                            }
                             should_draw = true;
                         }
                         WM_KEYDOWN => {
                             let key = wparam as i32;
-                            if key == VK_ESCAPE {
-                                should_exit = true;
+                            const KEY_1: i32 = '1' as i32;
+                            const KEY_2: i32 = '2' as i32;
+                            const KEY_3: i32 = '3' as i32;
+                            const KEY_4: i32 = '4' as i32;
+                            const KEY_5: i32 = '5' as i32;
+                            match key {
+                                VK_ESCAPE => {
+                                    should_exit = true;
+                                }
+                                VK_HOME => {
+                                    image_zoom = 1.0;
+                                    image_offset = FLOAT2_ZERO;
+                                }
+                                KEY_1 => {
+                                    image_zoom = 1.0;
+                                }
+                                KEY_2 => {
+                                    image_zoom = 1.0 / 2.0;
+                                }
+                                KEY_3 => {
+                                    image_zoom = 1.0 / 4.0;
+                                }
+                                KEY_4 => {
+                                    image_zoom = 1.0 / 8.0;
+                                }
+                                KEY_5 => {
+                                    image_zoom = 1.0 / 16.0;
+                                }
+                                _ => {}
                             }
                             should_draw = true;
                         }
@@ -631,6 +690,12 @@ fn main() {
         if !should_draw {
             continue;
         }
+
+        let zoom_vec = float2::new(image_zoom, image_zoom);
+        constants.uv_scale = zoom_vec.div_element_wise(constants.window_dim);
+        constants.uv_bias = image_offset
+            .mul_element_wise(zoom_vec)
+            .div_element_wise(constants.window_dim);
 
         let device = unsafe { graphics.device.as_ref().unwrap() };
         if let Ok(img) = image_rx.try_recv() {
@@ -717,7 +782,11 @@ fn main() {
 
             let cbvs: [*mut ID3D11Buffer; 1] = [graphics.constants];
             let srvs: [*mut ID3D11ShaderResourceView; 1] = [image_srv];
-            let samplers: [*mut ID3D11SamplerState; 1] = [graphics.smp_linear];
+            let samplers: [*mut ID3D11SamplerState; 3] = [
+                graphics.smp_linear, // g_default_sampler
+                graphics.smp_linear, // g_linear_sampler
+                graphics.smp_point,  // g_point_sampler
+            ];
 
             context.PSSetConstantBuffers(0, cbvs.len() as u32, cbvs.as_ptr());
             context.VSSetConstantBuffers(0, cbvs.len() as u32, cbvs.as_ptr());

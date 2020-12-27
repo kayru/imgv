@@ -23,6 +23,7 @@ winapi = { version = "0.3.9", features = [
     "winuser",
     ]}
 image = "0.23.12"
+cgmath = { version="0.17.0", features = []}
 
 [build-dependencies]
 winres = "0.1"
