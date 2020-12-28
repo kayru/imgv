@@ -25,18 +25,12 @@ use winapi::Interface;
 //use std::time::{Duration};
 use cgmath::{assert_ulps_eq, prelude::*};
 
+mod math;
+use math::*;
+
 const NUM_BACK_BUFFERS: u32 = 2;
 const WINDOW_MIN_WIDTH: i32 = 320;
 const WINDOW_MIN_HEIGHT: i32 = 240;
-
-#[allow(non_camel_case_types)]
-type float2 = cgmath::Vector2<f32>;
-
-#[allow(non_camel_case_types)]
-type float4 = cgmath::Vector4<f32>;
-
-const FLOAT2_ONE: float2 = float2::new(1.0, 1.0);
-const FLOAT2_ZERO: float2 = float2::new(0.0, 0.0);
 
 // TODO: can we generate this based on shader reflection or inject into shader code from rust?
 #[repr(C)]
@@ -45,8 +39,7 @@ struct Constants {
     image_dim: float2,
     window_dim: float2,
     mouse: float4, // float2 xy pos, uint buttons, uint unused
-    uv_scale: float2,
-    uv_bias: float2,
+    xfm_viewport_to_image_uv: float4,
 }
 
 struct WindowCreatedData {
@@ -76,90 +69,6 @@ struct Window {
 struct WindowThreadState {
     message_tx: std::sync::mpsc::Sender<WindowMessages>,
     is_window_closed: bool,
-}
-
-struct Transform2D {
-    scale: float2,
-    offset: float2,
-}
-
-impl Transform2D {
-    fn identity() -> Self {
-        Transform2D {
-            scale: FLOAT2_ONE,
-            offset: FLOAT2_ZERO,
-        }
-    }
-    fn inplace_translate(&mut self, v: float2) {
-        self.offset += v;
-    }
-    fn translate(&self, v: float2) -> Self {
-        Self {
-            scale: self.scale,
-            offset: self.offset + v,
-        }
-    }
-    fn transform_point(&self, v: float2) -> float2 {
-        v.mul_element_wise(self.scale) + self.offset
-    }
-    fn inverse(&self) -> Self {
-        Self {
-            scale: 1.0 / self.scale,
-            offset: -self.offset.div_element_wise(self.scale),
-        }
-    }
-    fn concatenate(&self, other: Self) -> Self {
-        Self {
-            scale: self.scale.mul_element_wise(other.scale),
-            offset: self.offset.mul_element_wise(other.scale) + other.offset,
-        }
-    }
-    fn inplace_concatenate(&mut self, other: Self) {
-        self.scale = self.scale.mul_element_wise(other.scale);
-        self.offset = self.offset.mul_element_wise(other.scale) + other.offset;
-    }
-}
-
-impl Default for Transform2D {
-    fn default() -> Self {
-        Transform2D::identity()
-    }
-}
-#[test]
-fn test_transform() {
-    {
-        let t = Transform2D {
-            scale: float2::new(2.0, 3.0),
-            offset: float2::new(4.0, 5.0),
-        };
-        let pa = float2::new(123.0, 456.0);
-        let pb = t.transform_point(pa);
-        let pc = t.inverse().transform_point(pb);
-        assert_ulps_eq!(pa, pc);
-    }
-    {
-        let t = Transform2D {
-            scale: float2::new(2.0, 3.0),
-            offset: float2::new(4.0, 5.0),
-        };
-        let pa = float2::new(1.0, 1.0);
-        let pb = t.transform_point(pa);
-        assert_ulps_eq!(pb, float2::new(6.0, 8.0));
-    }
-    {
-        let ta = Transform2D {
-            scale: float2::new(2.0, 3.0),
-            offset: float2::new(4.0, 5.0),
-        };
-        let tb = Transform2D {
-            scale: float2::new(3.0, 4.0),
-            offset: float2::new(5.0, 6.0),
-        };
-        let tc = ta.concatenate(tb);
-        let pa = float2::new(1.0, 1.0);
-        let pb = tc.transform_point(pa);
-        assert_ulps_eq!(pb, float2::new(23.0, 38.0));
-    }
 }
 
 fn get_window_client_rect_dimensions(hwnd: HWND) -> (u32, u32) {
@@ -217,6 +126,13 @@ unsafe extern "system" fn window_proc(
                 .unwrap();
             window_state.is_window_closed = true;
             PostQuitMessage(0);
+        }
+        WM_GETMINMAXINFO => {
+            if let Some(mmi) = (lparam as LPMINMAXINFO).as_mut() {
+                mmi.ptMinTrackSize.x = WINDOW_MIN_WIDTH;
+                mmi.ptMinTrackSize.y = WINDOW_MIN_HEIGHT;
+            }
+            return 0;
         }
         _ => {
             let window_state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowThreadState;
@@ -614,14 +530,8 @@ fn main() {
     let mut constants = Constants {
         image_dim: FLOAT2_ZERO,
         window_dim: FLOAT2_ZERO,
-        mouse: float4 {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-            w: 0.0,
-        },
-        uv_scale: FLOAT2_ONE,
-        uv_bias: FLOAT2_ZERO,
+        mouse: FLOAT4_ZERO,
+        xfm_viewport_to_image_uv: Transform2D::new_identity().to_float4(),
     };
 
     let mut image_tex: *mut ID3D11Texture2D = null_mut();
@@ -633,7 +543,7 @@ fn main() {
     let mut drag_origin = FLOAT2_ZERO;
     let mut mouse_pos = FLOAT2_ZERO;
 
-    let mut image_transform = Transform2D::default();
+    let mut xfm_window_to_image = Transform2D::new_identity();
 
     while !should_exit {
         let mut should_draw = false;
@@ -647,34 +557,27 @@ fn main() {
                     let lparam = native_msg.lparam;
                     let wparam = native_msg.wparam;
                     match native_msg.msg {
-                        WM_GETMINMAXINFO => unsafe {
-                            if let Some(mmi) = (lparam as LPMINMAXINFO).as_mut() {
-                                mmi.ptMinTrackSize.x = WINDOW_MIN_WIDTH;
-                                mmi.ptMinTrackSize.y = WINDOW_MIN_HEIGHT;
-                            }
-                        },
                         WM_PAINT => {
                             should_draw = true;
                         }
                         WM_MOUSEWHEEL => {
                             let scroll_delta = GET_WHEEL_DELTA_WPARAM(wparam);
-                            let zoom_transform = if scroll_delta > 0 {
-                                Transform2D {
-                                    scale: float2::new(0.9, 0.9),
-                                    offset: FLOAT2_ZERO,
-                                }
+                            let zoom = if scroll_delta > 0 {
+                                float2::new(0.8, 0.8)
                             } else {
-                                Transform2D {
-                                    scale: float2::new(1.1, 1.1),
-                                    offset: FLOAT2_ZERO,
-                                }
+                                float2::new(1.2, 1.2)
                             };
-                            image_transform.inplace_concatenate(zoom_transform);
+                            let mouse_pos_img = xfm_window_to_image.transform_point(mouse_pos);
+                            let zoom_transform = Transform2D::new_translate(-mouse_pos_img)
+                                .concatenate(Transform2D::new_scale(zoom))
+                                .concatenate(Transform2D::new_translate(mouse_pos_img));
+                            xfm_window_to_image.inplace_concatenate(zoom_transform);
                             should_draw = true;
+                            is_dragging = false;
                         }
                         WM_LBUTTONDOWN => {
                             is_dragging = true;
-                            drag_origin = mouse_pos - image_transform.offset;
+                            drag_origin = mouse_pos - xfm_window_to_image.inverse().offset;
                         }
                         WM_LBUTTONUP => {
                             is_dragging = false;
@@ -683,8 +586,10 @@ fn main() {
                             mouse_pos = decode_mouse_pos(lparam);
                             constants.mouse.x = mouse_pos.x;
                             constants.mouse.y = mouse_pos.y;
+                            let drag_delta: float2 = drag_origin - mouse_pos;
                             if is_dragging {
-                                image_transform.offset = mouse_pos - drag_origin;
+                                xfm_window_to_image.offset =
+                                    drag_delta.mul_element_wise(xfm_window_to_image.scale);
                             }
                             should_draw = true;
                         }
@@ -700,27 +605,27 @@ fn main() {
                                     should_exit = true;
                                 }
                                 VK_HOME => {
-                                    image_transform = Transform2D::identity();
+                                    xfm_window_to_image = Transform2D::new_identity();
                                 }
                                 KEY_1 => {
                                     let s = 1.0;
-                                    image_transform.scale = float2::new(s, s);
+                                    xfm_window_to_image.scale = float2::new(s, s);
                                 }
                                 KEY_2 => {
                                     let s = 1.0 / 2.0;
-                                    image_transform.scale = float2::new(s, s);
+                                    xfm_window_to_image.scale = float2::new(s, s);
                                 }
                                 KEY_3 => {
                                     let s = 1.0 / 4.0;
-                                    image_transform.scale = float2::new(s, s);
+                                    xfm_window_to_image.scale = float2::new(s, s);
                                 }
                                 KEY_4 => {
                                     let s = 1.0 / 8.0;
-                                    image_transform.scale = float2::new(s, s);
+                                    xfm_window_to_image.scale = float2::new(s, s);
                                 }
                                 KEY_5 => {
                                     let s = 1.0 / 16.0;
-                                    image_transform.scale = float2::new(s, s);
+                                    xfm_window_to_image.scale = float2::new(s, s);
                                 }
                                 _ => {}
                             }
@@ -785,16 +690,21 @@ fn main() {
             continue;
         }
 
-        constants.uv_scale = image_transform.scale.div_element_wise(constants.window_dim);
-        constants.uv_bias = -image_transform
-            .offset
-            .mul_element_wise(image_transform.scale)
-            .div_element_wise(constants.window_dim);
+        let xfm_viewport_to_image_uv = Transform2D {
+            scale: 1.0 / constants.window_dim,
+            offset: FLOAT2_ZERO,
+        };
 
-        println!(
-            "mpos: {:?}, offset: {:?}, scale: {:?}",
-            mouse_pos, image_transform.offset, image_transform.scale
-        );
+        constants.xfm_viewport_to_image_uv = xfm_window_to_image
+            .concatenate(xfm_viewport_to_image_uv)
+            .to_float4();
+
+        // println!(
+        //     "mpos: {:?}, offset: {:?}, scale: {:?}",
+        //     mouse_pos,
+        //     xfm_window_to_image.offset,
+        //     xfm_window_to_image.scale
+        // );
 
         let device = unsafe { graphics.device.as_ref().unwrap() };
         if let Ok(img) = image_rx.try_recv() {
