@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
-use std::ffi::OsStr;
+use std::{ffi::OsStr, path::PathBuf};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::prelude::*;
@@ -52,10 +52,15 @@ struct NativeMessageData {
     lparam: LPARAM,
 }
 
+struct OpenFileData {
+    path: OsString
+}
+
 enum WindowMessages {
     WindowCreated(WindowCreatedData),
     WindowClosed,
     NativeMessage(NativeMessageData),
+    OpenFile(OpenFileData)
 }
 
 unsafe impl std::marker::Send for WindowCreatedData {}
@@ -179,7 +184,7 @@ impl Window {
                     assert!(hicon != (0 as HICON), "failed to load icon");
 
                     let window_class = WNDCLASSW {
-                        style: 0, //CS_DBLCLKS | CS_OWNDC | CS_HREDRAW | CS_VREDRAW,
+                        style: CS_HREDRAW | CS_VREDRAW | CS_SAVEBITS | CS_DBLCLKS | CS_OWNDC | CS_SAVEBITS,
                         lpfnWndProc: Some(window_proc),
                         cbClsExtra: 0,
                         cbWndExtra: 0,
@@ -753,8 +758,9 @@ fn main() {
                     dim
                 );
                 main_window.set_image_size((dim.0 as i32, dim.1 as i32));
+                xfm_window_to_image = Transform2D::new_identity();
             } else {
-                println!("Failed to load image");
+                println!("Failed to load image: {:?}", img.err());
             };
         }
 

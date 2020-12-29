@@ -22,7 +22,11 @@ winapi = { version = "0.3.9", features = [
     "winerror", 
     "winuser",
     ]}
-image = "0.23.12"
+
+#image = "0.23.12"
+#image = { path="../image-rs-fixes" }
+image = { git="https://github.com/kayru/image-rs-fixes.git", branch="allow_tga_a8_as_l8" }
+
 cgmath = { version="0.17.0", features = []}
 
 [build-dependencies]
