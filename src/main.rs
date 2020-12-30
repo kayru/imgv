@@ -2,12 +2,12 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
-use std::{ffi::OsStr, path::PathBuf};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::prelude::*;
 use std::ptr::null_mut;
 use std::time::Instant;
+use std::{ffi::OsStr, path::Path, path::PathBuf};
 use winapi::ctypes::c_void;
 use winapi::shared::dxgi::*;
 use winapi::shared::dxgiformat::*;
@@ -53,14 +53,14 @@ struct NativeMessageData {
 }
 
 struct OpenFileData {
-    path: OsString
+    filename: OsString,
 }
 
 enum WindowMessages {
     WindowCreated(WindowCreatedData),
     WindowClosed,
     NativeMessage(NativeMessageData),
-    OpenFile(OpenFileData)
+    OpenFile(OpenFileData),
 }
 
 unsafe impl std::marker::Send for WindowCreatedData {}
@@ -110,6 +110,9 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    let window_state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowThreadState;
+    let window_state = window_state_ptr.as_mut();
+
     match msg {
         WM_CREATE => {
             let create_struct = lparam as *mut winapi::um::winuser::CREATESTRUCTW;
@@ -123,8 +126,7 @@ unsafe extern "system" fn window_proc(
                 .unwrap();
         }
         WM_DESTROY => {
-            let window_state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowThreadState;
-            let window_state: &mut WindowThreadState = window_state_ptr.as_mut().unwrap();
+            let window_state = window_state.unwrap();
             window_state
                 .message_tx
                 .send(WindowMessages::WindowClosed)
@@ -139,10 +141,32 @@ unsafe extern "system" fn window_proc(
             }
             return 0;
         }
+        WM_DROPFILES => {
+            if let Some(window_state) = window_state {
+                use winapi::um::shellapi::*;
+                let hdrop = wparam as HDROP;
+                let filename_len = DragQueryFileW(hdrop, 0, null_mut(), 0) as usize;
+                if filename_len > 0 {
+                    let mut filename_bytes = Vec::<u16>::with_capacity(filename_len + 1);
+                    filename_bytes.set_len(filename_len + 1);
+                    DragQueryFileW(
+                        hdrop,
+                        0,
+                        filename_bytes.as_mut_ptr(),
+                        filename_bytes.len() as u32,
+                    );
+                    filename_bytes.set_len(filename_bytes.len() - 1);
+                    let filename = OsString::from_wide(&filename_bytes);
+                    window_state
+                        .message_tx
+                        .send(WindowMessages::OpenFile(OpenFileData { filename }))
+                        .unwrap();
+                }
+                DragFinish(hdrop);
+            }
+        }
         _ => {
-            let window_state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowThreadState;
-            if !window_state_ptr.is_null() {
-                let window_state: &mut WindowThreadState = window_state_ptr.as_mut().unwrap();
+            if let Some(window_state) = window_state {
                 window_state
                     .message_tx
                     .send(WindowMessages::NativeMessage(NativeMessageData {
@@ -174,6 +198,8 @@ impl Window {
                 };
 
                 unsafe {
+                    SetProcessDpiAwareness(1);
+
                     let window_name: Vec<u16> = OsStr::new("imgv\0").encode_wide().collect();
                     let icon_name: Vec<u16> = OsStr::new("imgv\0").encode_wide().collect();
                     let window_class_name: Vec<u16> =
@@ -184,7 +210,12 @@ impl Window {
                     assert!(hicon != (0 as HICON), "failed to load icon");
 
                     let window_class = WNDCLASSW {
-                        style: CS_HREDRAW | CS_VREDRAW | CS_SAVEBITS | CS_DBLCLKS | CS_OWNDC | CS_SAVEBITS,
+                        style: CS_HREDRAW
+                            | CS_VREDRAW
+                            | CS_SAVEBITS
+                            | CS_DBLCLKS
+                            | CS_OWNDC
+                            | CS_SAVEBITS,
                         lpfnWndProc: Some(window_proc),
                         cbClsExtra: 0,
                         cbWndExtra: 0,
@@ -487,18 +518,68 @@ fn decode_mouse_pos(lparam: isize) -> float2 {
     float2 { x, y }
 }
 
+#[derive(Debug, PartialEq)]
+enum StepDirection {
+    Backward,
+    Forward,
+}
+
+fn is_compatible_file(path: &Path) -> bool {
+    let extensions = [
+        "jpg", "jpeg", "png", "gif", "webp", "tif", "tiff", "tga", "dds", "bmp", "ico", "hdr",
+        "pbm", "pam", "ppm", "pgm", "ff",
+    ];
+    if let Some(ext) = path.extension() {
+        let ext = ext.to_string_lossy().to_ascii_lowercase();
+        for it in &extensions {
+            if *it == ext {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn get_next_file(path: &Path, direction: StepDirection) -> Option<PathBuf> {
+    let file_dir = path.parent().unwrap();
+    let file_name = path.file_name().unwrap();
+    let dir = std::fs::read_dir(file_dir);
+    if let Ok(dir) = dir {
+        let files: Vec<_> = dir
+            .filter_map(|f| {
+                if f.is_ok() {
+                    Some(f.unwrap().path())
+                } else {
+                    None
+                }
+            })
+            .filter(|f| is_compatible_file(f))
+            .map(|f| f.file_name().unwrap().to_owned())
+            .collect();
+        if let Some(i) = files.iter().position(|f| f == file_name) {
+            return match direction {
+                StepDirection::Backward if i > 0 => Some(files[i - 1].clone().into()),
+                StepDirection::Forward if i + 1 < files.len() => Some(files[i + 1].clone().into()),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
 fn main() {
     let main_begin_time = Instant::now();
 
-    unsafe { SetProcessDpiAwareness(1) };
-
+    let mut image_path: Option<PathBuf> = None;
+    
     let (load_req_tx, load_req_rx) = std::sync::mpsc::channel();
     let (image_tx, image_rx) = std::sync::mpsc::channel();
 
     if std::env::args().len() > 1 {
         let args: Vec<String> = std::env::args().collect();
-        let filename: OsString = args[1].clone().into();
-        let _ = load_req_tx.send(filename);
+        let path: PathBuf = args[1].clone().into();
+        image_path = Some(path.clone());
+        load_req_tx.send(path).unwrap();
     }
 
     let mut main_window: Window = Window::new((500, 500)).unwrap();
@@ -550,11 +631,29 @@ fn main() {
 
     let mut xfm_window_to_image = Transform2D::new_identity();
 
+    let switch_to_next_image = |current_image_path: &Path, direction: StepDirection| {
+        let file_name = get_next_file(current_image_path, direction);
+        let file_dir = current_image_path.parent();
+        if file_name.is_some() && file_dir.is_some() {
+            let file_name = file_name.unwrap();
+            let file_dir = file_dir.unwrap().to_path_buf();
+            let path = file_dir.join(file_name);
+            load_req_tx.send(path.clone()).unwrap();
+            Some(path)
+        } else {
+            Some(current_image_path.into())
+        }
+    };
+
     while !should_exit {
         let mut should_draw = false;
         if let Some(x) = process_window_messages(&main_window, should_block) {
             should_block = false;
             match x {
+                WindowMessages::OpenFile(data) => {
+                    image_path = Some(data.filename.clone().into());
+                    load_req_tx.send(data.filename.into()).unwrap();
+                }
                 WindowMessages::WindowClosed => {
                     should_exit = true;
                 }
@@ -587,6 +686,23 @@ fn main() {
                         WM_LBUTTONUP => {
                             is_dragging = false;
                         }
+                        WM_XBUTTONDOWN | WM_XBUTTONDBLCLK => {
+                            let button_index = winapi::shared::minwindef::HIWORD(wparam as u32);
+                            if let Some(image_path_local) = &image_path {
+                                match button_index {
+                                    1 => {
+                                        image_path = switch_to_next_image(image_path_local, StepDirection::Backward);
+                                    }
+                                    2 => {
+                                        image_path = switch_to_next_image(image_path_local, StepDirection::Forward);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        WM_XBUTTONUP => {
+                            // println!("WM_XBUTTONUP");
+                        }
                         WM_MOUSEMOVE => {
                             mouse_pos = decode_mouse_pos(lparam);
                             constants.mouse.x = mouse_pos.x;
@@ -599,36 +715,36 @@ fn main() {
                             should_draw = true;
                         }
                         WM_KEYDOWN => {
-                            let key = wparam as i32;
-                            const KEY_1: i32 = '1' as i32;
-                            const KEY_2: i32 = '2' as i32;
-                            const KEY_3: i32 = '3' as i32;
-                            const KEY_4: i32 = '4' as i32;
-                            const KEY_5: i32 = '5' as i32;
-                            match key {
-                                VK_ESCAPE => {
+                            match (wparam as i32, wparam as u8 as char) {
+                                (VK_ESCAPE, _) => {
                                     should_exit = true;
                                 }
-                                VK_HOME => {
+                                (VK_HOME, _) => {
                                     xfm_window_to_image = Transform2D::new_identity();
                                 }
-                                KEY_1 => {
+                                (VK_LEFT, _) if image_path.is_some() => {
+                                    image_path = switch_to_next_image(&image_path.unwrap(), StepDirection::Backward);
+                                }
+                                (VK_RIGHT, _) if image_path.is_some() => {
+                                    image_path = switch_to_next_image(&image_path.unwrap(), StepDirection::Forward);
+                                }
+                                (_, '1') => {
                                     let s = 1.0;
                                     xfm_window_to_image.scale = float2::new(s, s);
                                 }
-                                KEY_2 => {
+                                (_, '2') => {
                                     let s = 1.0 / 2.0;
                                     xfm_window_to_image.scale = float2::new(s, s);
                                 }
-                                KEY_3 => {
+                                (_, '3') => {
                                     let s = 1.0 / 4.0;
                                     xfm_window_to_image.scale = float2::new(s, s);
                                 }
-                                KEY_4 => {
+                                (_, '4') => {
                                     let s = 1.0 / 8.0;
                                     xfm_window_to_image.scale = float2::new(s, s);
                                 }
-                                KEY_5 => {
+                                (_, '5') => {
                                     let s = 1.0 / 16.0;
                                     xfm_window_to_image.scale = float2::new(s, s);
                                 }
@@ -643,7 +759,7 @@ fn main() {
                             pending_window_dim.y = height as f32;
                             if wparam == SIZE_MAXIMIZED || wparam == SIZE_RESTORED {
                                 if !is_resizing {
-                                    constants.window_dim = pending_window_dim.to_owned();
+                                    constants.window_dim = pending_window_dim.clone();
                                     unsafe { graphics.update_backbuffer(main_window.hwnd) };
                                 }
                             }
@@ -653,34 +769,14 @@ fn main() {
                             is_resizing = true;
                         }
                         WM_EXITSIZEMOVE => {
-                            constants.window_dim = pending_window_dim.to_owned();
+                            constants.window_dim = pending_window_dim.clone();
                             unsafe { graphics.update_backbuffer(main_window.hwnd) };
                             should_draw = true;
                             is_resizing = false;
                         }
-                        WM_DROPFILES => {
-                            use winapi::um::shellapi::*;
-                            let hdrop = wparam as HDROP;
-                            unsafe {
-                                let filename_len = DragQueryFileW(hdrop, 0, null_mut(), 0) as usize;
-                                if filename_len > 0 {
-                                    let mut filename_bytes =
-                                        Vec::<u16>::with_capacity(filename_len + 1);
-                                    filename_bytes.set_len(filename_len + 1);
-                                    DragQueryFileW(
-                                        hdrop,
-                                        0,
-                                        filename_bytes.as_mut_ptr(),
-                                        filename_bytes.len() as u32,
-                                    );
-                                    filename_bytes.set_len(filename_bytes.len() - 1);
-                                    let filename = OsString::from_wide(&filename_bytes);
-                                    let _ = load_req_tx.send(filename);
-                                }
-                                DragFinish(hdrop);
-                            }
+                        _ => {
+                            // println!("msg: {}", native_msg.msg);
                         }
-                        _ => {}
                     }
                 }
                 _ => {
@@ -703,13 +799,6 @@ fn main() {
         constants.xfm_viewport_to_image_uv = xfm_window_to_image
             .concatenate(xfm_viewport_to_image_uv)
             .to_float4();
-
-        // println!(
-        //     "mpos: {:?}, offset: {:?}, scale: {:?}",
-        //     mouse_pos,
-        //     xfm_window_to_image.offset,
-        //     xfm_window_to_image.scale
-        // );
 
         let device = unsafe { graphics.device.as_ref().unwrap() };
         if let Ok(img) = image_rx.try_recv() {
@@ -762,6 +851,10 @@ fn main() {
             } else {
                 println!("Failed to load image: {:?}", img.err());
             };
+
+            unsafe {
+                InvalidateRect(main_window_handle as HWND, null_mut(), 1);
+            }
         }
 
         if frame_number == 0 {
@@ -784,7 +877,7 @@ fn main() {
             let rtvs: [*mut ID3D11RenderTargetView; 1] = [graphics.backbuffer_rtv];
             context.OMSetRenderTargets(1, rtvs.as_ptr(), null_mut());
 
-            let viewport: D3D11_VIEWPORT = D3D11_VIEWPORT {
+            let viewport = D3D11_VIEWPORT {
                 Width: graphics.backbuffer_dim.0 as f32,
                 Height: graphics.backbuffer_dim.1 as f32,
                 MinDepth: 0.0,
