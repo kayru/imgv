@@ -105,6 +105,12 @@ impl Transform2D {
     }
 }
 
+impl Into<float4> for Transform2D {
+    fn into(self) -> float4 {
+        self.to_float4()
+    }
+}
+
 impl Default for Transform2D {
     fn default() -> Self {
         Transform2D::new_identity()

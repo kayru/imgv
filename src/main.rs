@@ -617,7 +617,7 @@ fn main() {
         image_dim: FLOAT2_ZERO,
         window_dim: FLOAT2_ZERO,
         mouse: FLOAT4_ZERO,
-        xfm_viewport_to_image_uv: Transform2D::new_identity().to_float4(),
+        xfm_viewport_to_image_uv: Transform2D::new_identity().into(),
     };
 
     let mut image_tex: *mut ID3D11Texture2D = null_mut();
@@ -798,7 +798,7 @@ fn main() {
 
         constants.xfm_viewport_to_image_uv = xfm_window_to_image
             .concatenate(xfm_viewport_to_image_uv)
-            .to_float4();
+            .into();
 
         let device = unsafe { graphics.device.as_ref().unwrap() };
         if let Ok(img) = image_rx.try_recv() {
