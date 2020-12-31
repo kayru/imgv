@@ -623,13 +623,15 @@ fn main() {
     let mut image_tex: *mut ID3D11Texture2D = null_mut();
     let mut image_srv: *mut ID3D11ShaderResourceView = null_mut();
     let mut is_resizing = false;
-    let mut should_block = true;
     let mut pending_window_dim = FLOAT2_ONE;
     let mut is_dragging = false;
     let mut drag_origin = FLOAT2_ZERO;
     let mut mouse_pos = FLOAT2_ZERO;
-
+    let mut should_draw = true;
+    let mut should_block = true;
     let mut xfm_window_to_image = Transform2D::new_identity();
+    let mut handled_events = 0;
+    let mut last_frame_draw_time = Instant::now();
 
     let switch_to_next_image = |current_image_path: &Path, direction: StepDirection| {
         let file_name = get_next_file(current_image_path, direction);
@@ -646,7 +648,6 @@ fn main() {
     };
 
     while !should_exit {
-        let mut should_draw = false;
         if let Some(x) = process_window_messages(&main_window, should_block) {
             should_block = false;
             match x {
@@ -790,6 +791,10 @@ fn main() {
                             // println!("msg: {}", native_msg.msg);
                         }
                     }
+
+                    if should_draw {
+                        handled_events += 1;
+                    }
                 }
                 _ => {
                     panic!("unhandled windows message type");
@@ -799,7 +804,7 @@ fn main() {
             should_block = true;
         }
 
-        if !should_draw {
+        if !should_draw || !should_block {
             continue;
         }
 
@@ -871,10 +876,14 @@ fn main() {
 
         if frame_number == 0 {
             let init_time = Instant::now() - main_begin_time;
-            println!("Init time: {}ms", init_time.as_secs_f32() * 1000.0);
+            println!("Init time: {:.2}ms", init_time.as_secs_f32() * 1000.0);
         }
 
         unsafe {
+            let frame_delta_time = Instant::now() - last_frame_draw_time;
+            last_frame_draw_time = Instant::now();
+            println!("Draw dt: {:.2}ms, frame_number: {}, handled_events: {}", frame_delta_time.as_secs_f32() * 1000.0, frame_number, handled_events);
+
             let context = graphics.context.as_ref().unwrap();
 
             context.UpdateSubresource(
@@ -924,10 +933,12 @@ fn main() {
             context.Draw(3, 0);
 
             context.ClearState();
-
+            
             graphics.swapchain.as_ref().unwrap().Present(0, 0);
         };
 
         frame_number += 1;
+        should_draw = false;
+        handled_events = 0;
     }
 }
