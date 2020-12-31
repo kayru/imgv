@@ -571,7 +571,7 @@ fn main() {
     let main_begin_time = Instant::now();
 
     let mut image_path: Option<PathBuf> = None;
-    
+
     let (load_req_tx, load_req_rx) = std::sync::mpsc::channel();
     let (image_tx, image_rx) = std::sync::mpsc::channel();
 
@@ -691,10 +691,16 @@ fn main() {
                             if let Some(image_path_local) = &image_path {
                                 match button_index {
                                     1 => {
-                                        image_path = switch_to_next_image(image_path_local, StepDirection::Backward);
+                                        image_path = switch_to_next_image(
+                                            image_path_local,
+                                            StepDirection::Backward,
+                                        );
                                     }
                                     2 => {
-                                        image_path = switch_to_next_image(image_path_local, StepDirection::Forward);
+                                        image_path = switch_to_next_image(
+                                            image_path_local,
+                                            StepDirection::Forward,
+                                        );
                                     }
                                     _ => {}
                                 }
@@ -711,8 +717,8 @@ fn main() {
                             if is_dragging {
                                 xfm_window_to_image.offset =
                                     drag_delta.mul_element_wise(xfm_window_to_image.scale);
+                                should_draw = true;
                             }
-                            should_draw = true;
                         }
                         WM_KEYDOWN => {
                             match (wparam as i32, wparam as u8 as char) {
@@ -723,10 +729,16 @@ fn main() {
                                     xfm_window_to_image = Transform2D::new_identity();
                                 }
                                 (VK_LEFT, _) if image_path.is_some() => {
-                                    image_path = switch_to_next_image(&image_path.unwrap(), StepDirection::Backward);
+                                    image_path = switch_to_next_image(
+                                        &image_path.unwrap(),
+                                        StepDirection::Backward,
+                                    );
                                 }
                                 (VK_RIGHT, _) if image_path.is_some() => {
-                                    image_path = switch_to_next_image(&image_path.unwrap(), StepDirection::Forward);
+                                    image_path = switch_to_next_image(
+                                        &image_path.unwrap(),
+                                        StepDirection::Forward,
+                                    );
                                 }
                                 (_, '1') => {
                                     let s = 1.0;
