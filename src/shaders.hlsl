@@ -29,10 +29,10 @@ VSOut blit_vs(uint i: SV_VERTEXID) {
 
 float4 background_color(uint2 pixel_pos) {
 	pixel_pos /= 8;
-	float c = 0.1;
+	float c = 0.08;
 	return ((pixel_pos.x + pixel_pos.y) & 1) 
-	? float4((float3)0.5 + c, 1.0)
-	: float4((float3)0.5 - c, 1.0);
+	? float4((float3)0.65 + c, 1.0)
+	: float4((float3)0.65 - c, 1.0);
 }
 
 float2 viewport_to_image_uv(float2 viewport_pos) {
