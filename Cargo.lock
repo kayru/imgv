@@ -84,6 +84,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
 
 [[package]]
+name = "com_ptr"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd7910ed7d62369ab3fc1d28ec6f91cff84f185b0bf681eb5a4225978469d72d"
+dependencies = [
+ "winapi",
+]
+
+[[package]]
 name = "const_fn"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -228,6 +237,7 @@ name = "imgv"
 version = "0.1.0"
 dependencies = [
  "cgmath",
+ "com_ptr",
  "ico",
  "image",
  "winapi",
