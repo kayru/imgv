@@ -121,6 +121,16 @@ pub fn clamp(x: f32, min: f32, max: f32) -> f32 {
     x.max(min).min(max)
 }
 
+pub fn align_up(i: i32, alignment: i32) -> i32 {
+    ((i + alignment - 1) / alignment) * alignment
+}
+
+#[test]
+fn test_align() {
+    assert_eq!(align_up(3, 4), 4);
+    assert_eq!(align_up(3, 10), 10);
+}
+
 #[test]
 fn test_transform() {
     {

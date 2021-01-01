@@ -520,9 +520,8 @@ impl GraphicsD3D11 {
 
     fn update_backbuffer(&mut self, hwnd: HWND) {
         let mut new_dim = get_window_client_rect_dimensions(hwnd);
-        let screen_dim = get_screen_dimensions();
-        new_dim.0 = new_dim.0.max(screen_dim.0);
-        new_dim.1 = new_dim.1.max(screen_dim.1);
+        new_dim.0 = align_up(new_dim.0, 512);
+        new_dim.1 = align_up(new_dim.1, 512);
 
         if let Some(backbuffer) = &self.backbuffer {
             if backbuffer.dim.0 as i32 >= new_dim.0 && backbuffer.dim.1 as i32 >= new_dim.1 {
@@ -533,8 +532,8 @@ impl GraphicsD3D11 {
         // Release old render target view before resizing back buffer
         self.backbuffer = None;
 
-        assert!(new_dim.0 < 8192);
-        assert!(new_dim.1 < 8192);
+        assert!(new_dim.0 < 16384);
+        assert!(new_dim.1 < 16384);
 
         println!("update_backbuffer {:?}", new_dim);
 
@@ -731,8 +730,7 @@ fn main() {
     };
 
     let mut texture = None;
-    let mut is_resizing = false;
-    let mut pending_window_dim = FLOAT2_ONE;
+    let mut _is_resizing = false;
     let mut is_dragging = false;
     let mut drag_origin = FLOAT2_ZERO;
     let mut mouse_pos = FLOAT2_ZERO;
@@ -877,24 +875,17 @@ fn main() {
                         WM_SIZE => {
                             let width = winapi::shared::minwindef::LOWORD(lparam as u32);
                             let height = winapi::shared::minwindef::HIWORD(lparam as u32);
-                            pending_window_dim.x = width as f32;
-                            pending_window_dim.y = height as f32;
-                            if wparam == SIZE_MAXIMIZED || wparam == SIZE_RESTORED {
-                                if !is_resizing {
-                                    constants.window_dim = pending_window_dim.clone();
-                                    graphics.update_backbuffer(main_window.hwnd);
-                                }
-                            }
+                            constants.window_dim.x = width as f32;
+                            constants.window_dim.y = height as f32;
+                            graphics.update_backbuffer(main_window.hwnd);
                             should_draw = true;
                         }
                         WM_ENTERSIZEMOVE => {
-                            is_resizing = true;
+                            _is_resizing = true;
                         }
                         WM_EXITSIZEMOVE => {
-                            constants.window_dim = pending_window_dim.clone();
-                            graphics.update_backbuffer(main_window.hwnd);
                             should_draw = true;
-                            is_resizing = false;
+                            _is_resizing = false;
                         }
                         _ => {
                             // println!("msg: {}", native_msg.msg);
@@ -918,7 +909,7 @@ fn main() {
         }
 
         let xfm_viewport_to_image_uv = Transform2D {
-            scale: 1.0 / constants.window_dim,
+            scale: 1.0 / constants.image_dim,
             offset: FLOAT2_ZERO,
         };
 
