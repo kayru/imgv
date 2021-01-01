@@ -320,7 +320,7 @@ struct BackBuffer {
 
 struct GraphicsD3D11 {
     device: ComPtr<ID3D11Device>,
-    info_queue: ComPtr<ID3D11InfoQueue>,
+    info_queue: Option<ComPtr<ID3D11InfoQueue>>,
     context: ComPtr<ID3D11DeviceContext>,
     swapchain: ComPtr<IDXGISwapChain>,
     backbuffer: Option<BackBuffer>,
@@ -482,7 +482,7 @@ impl GraphicsD3D11 {
 
         let mut result = GraphicsD3D11 {
             device: ComPtr::from_raw(device),
-            info_queue: ComPtr::from_raw(info_queue),
+            info_queue: if info_queue.is_null() { None } else { Some(ComPtr::from_raw(info_queue)) },
             context: ComPtr::from_raw(context),
             swapchain: ComPtr::from_raw(swapchain),
             backbuffer: None,

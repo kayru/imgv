@@ -51,7 +51,7 @@ float4 blit_ps(VSOut v) : SV_TARGET {
 
 	float2 uv = viewport_to_image_uv(v.pos.xy);
 	float4 image_color = g_image.SampleLevel(g_point_sampler, uv, 0);
-	if (any(abs(uv-0.5) > 0.5)) {
+	if (any(abs(uv-0.5) > 0.5) || g_constants.image_dim.x == 0) {
 		image_color = background_color((uint2)(v.pos.xy));
 	}
 
