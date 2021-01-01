@@ -13,6 +13,7 @@ use std::time::Instant;
 use std::{ffi::OsStr, path::Path, path::PathBuf};
 use winapi::ctypes::c_void;
 use winapi::shared::dxgi::*;
+use winapi::shared::dxgi1_2::*;
 use winapi::shared::dxgiformat::*;
 use winapi::shared::dxgitype::*;
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
@@ -35,6 +36,10 @@ const BACK_BUFFER_FORMAT: u32 = DXGI_FORMAT_R8G8B8A8_UNORM;
 
 const WINDOW_MIN_WIDTH: i32 = 320;
 const WINDOW_MIN_HEIGHT: i32 = 240;
+
+const DXGI_MWA_NO_WINDOW_CHANGES: UINT = 1;
+const DXGI_MWA_NO_ALT_ENTER: UINT = 2;
+const DXGI_MWA_NO_PRINT_SCREEN: UINT = 4;
 
 // TODO: can we generate this based on shader reflection or inject into shader code from rust?
 #[repr(C)]
@@ -80,7 +85,11 @@ struct WindowThreadState {
     is_window_closed: bool,
 }
 
-fn get_window_client_rect_dimensions(hwnd: HWND) -> (u32, u32) {
+fn get_screen_dimensions() -> (i32, i32) {
+    unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
+}
+
+fn get_window_client_rect_dimensions(hwnd: HWND) -> (i32, i32) {
     let mut client_rect = winapi::shared::windef::RECT {
         left: 0,
         right: 0,
@@ -91,14 +100,14 @@ fn get_window_client_rect_dimensions(hwnd: HWND) -> (u32, u32) {
         GetClientRect(hwnd, &mut client_rect);
     }
     let dimensions = (
-        (client_rect.right - client_rect.left) as u32,
-        (client_rect.bottom - client_rect.top) as u32,
+        (client_rect.right - client_rect.left),
+        (client_rect.bottom - client_rect.top)
     );
     dimensions
 }
 
 fn compute_client_rect(dim: (i32, i32)) -> winapi::shared::windef::RECT {
-    let screen_dim = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    let screen_dim = get_screen_dimensions();
     let window_pos = (screen_dim.0 / 2 - dim.0 / 2, screen_dim.1 / 2 - dim.1 / 2);
     winapi::shared::windef::RECT {
         left: window_pos.0,
@@ -214,11 +223,7 @@ impl Window {
                     assert!(hicon != (0 as HICON), "failed to load icon");
 
                     let window_class = WNDCLASSW {
-                        style: CS_HREDRAW
-                            | CS_VREDRAW
-                            | CS_DBLCLKS
-                            | CS_OWNDC
-                            | CS_SAVEBITS,
+                        style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS | CS_OWNDC | CS_SAVEBITS,
                         lpfnWndProc: Some(window_proc),
                         cbClsExtra: 0,
                         cbWndExtra: 0,
@@ -322,7 +327,7 @@ struct GraphicsD3D11 {
     device: ComPtr<ID3D11Device>,
     info_queue: Option<ComPtr<ID3D11InfoQueue>>,
     context: ComPtr<ID3D11DeviceContext>,
-    swapchain: ComPtr<IDXGISwapChain>,
+    swapchain: ComPtr<IDXGISwapChain1>,
     backbuffer: Option<BackBuffer>,
     blit_vs: ComPtr<ID3D11VertexShader>,
     blit_ps: ComPtr<ID3D11PixelShader>,
@@ -333,41 +338,32 @@ struct GraphicsD3D11 {
 
 impl GraphicsD3D11 {
     unsafe fn new(hwnd: HWND) -> Result<Self, ()> {
-        
         let device_flags = 0u32 | { D3D11_CREATE_DEVICE_DEBUG * cfg!(debug_assertions) as u32 };
 
         let feature_levels: D3D_FEATURE_LEVEL = D3D_FEATURE_LEVEL_11_1;
         let num_feature_levels: UINT = 1;
 
-        let swapchain_desc = DXGI_SWAP_CHAIN_DESC {
-            BufferDesc: DXGI_MODE_DESC {
-                Width: 0,
-                Height: 0,
-                RefreshRate: DXGI_RATIONAL {
-                    Numerator: 60,
-                    Denominator: 1,
-                },
-                Format: BACK_BUFFER_FORMAT,
-                Scaling: DXGI_MODE_SCALING_UNSPECIFIED,
-                ScanlineOrdering: DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED,
-            },
-            BufferCount: NUM_BACK_BUFFERS,
-            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-            Flags: 0,
+        let swapchain_desc = DXGI_SWAP_CHAIN_DESC1 {
+            Width: 0,
+            Height: 0,
+            Format: BACK_BUFFER_FORMAT,
+            Stereo: 0,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
             },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: NUM_BACK_BUFFERS,
+            Scaling: DXGI_SCALING_NONE,
             SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-            OutputWindow: hwnd,
-            Windowed: 1,
+            AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+            Flags: 0,
         };
 
-        let mut swapchain: *mut IDXGISwapChain = null_mut();
         let mut device: *mut ID3D11Device = null_mut();
         let mut context: *mut ID3D11DeviceContext = null_mut();
 
-        let hr: HRESULT = D3D11CreateDeviceAndSwapChain(
+        let hr: HRESULT = D3D11CreateDevice(
             null_mut(),
             D3D_DRIVER_TYPE_HARDWARE,
             null_mut(),
@@ -375,35 +371,54 @@ impl GraphicsD3D11 {
             &feature_levels,
             num_feature_levels,
             D3D11_SDK_VERSION,
-            &swapchain_desc,
-            &mut swapchain,
             &mut device,
             null_mut(),
             &mut context,
         );
         assert!(hr == S_OK, "D3D11 device creation failed");
+        let device = ComPtr::from_raw(device);
 
-        /*
-        let hr: HRESULT = D3D11CreateDevice(
-            adapter,
-            D3D_DRIVER_TYPE_HARDWARE,
+        let dxgi_device: ComPtr<IDXGIDevice1> = device
+            .query_interface::<IDXGIDevice1>()
+            .expect("Failed to aquire DXGI device");
+        let dxgi_adapter: ComPtr<IDXGIAdapter> = ComPtr::new(|| {
+            let mut obj: *mut IDXGIAdapter = null_mut();
+            let hr: HRESULT = dxgi_device.GetAdapter(&mut obj);
+            hresult(obj, hr)
+        })
+        .unwrap();
+        let dxgi_factory: ComPtr<IDXGIFactory2> = ComPtr::new(|| {
+            let mut obj: *mut IDXGIFactory2 = null_mut();
+            let hr: HRESULT = dxgi_adapter.GetParent(
+                &IDXGIFactory2::uuidof(),
+                &mut obj as *mut *mut IDXGIFactory2 as _,
+            );
+            hresult(obj, hr)
+        })
+        .unwrap();
+
+        let mut swapchain: *mut IDXGISwapChain1 = null_mut();
+        let hr: HRESULT = dxgi_factory.CreateSwapChainForHwnd(
+            device.as_ptr() as _,
+            hwnd,
+            &swapchain_desc,
             null_mut(),
-            device_flags,
-            &feature_levels,
-            num_feature_levels,
-            D3D11_SDK_VERSION,
-            &mut result.device,
             null_mut(),
-            &mut result.context,
+            &mut swapchain,
         );
-        assert!(hr == S_OK, "D3D11 device creation failed");
-        */
+        assert!(hr == S_OK);
 
-        let device_ref = device.as_ref().unwrap();
+        dxgi_factory.MakeWindowAssociation(
+            hwnd,
+            DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_PRINT_SCREEN,
+        );
+
+        let swapchain = ComPtr::from_raw(swapchain);
+
         let mut info_queue: *mut ID3D11InfoQueue = null_mut();
 
         if (device_flags & D3D11_CREATE_DEVICE_DEBUG) != 0 {
-            device_ref.QueryInterface(
+            device.QueryInterface(
                 &ID3D11InfoQueue::uuidof(),
                 &mut info_queue as *mut *mut ID3D11InfoQueue as _,
             );
@@ -417,7 +432,7 @@ impl GraphicsD3D11 {
 
         let mut blit_vs = null_mut();
         let shader_blit_vs = include_bytes!(concat!(env!("OUT_DIR"), "/blit_vs.dxbc"));
-        let hr: HRESULT = device_ref.CreateVertexShader(
+        let hr: HRESULT = device.CreateVertexShader(
             shader_blit_vs.as_ptr() as *const c_void,
             shader_blit_vs.len(),
             null_mut(),
@@ -427,7 +442,7 @@ impl GraphicsD3D11 {
 
         let mut blit_ps = null_mut();
         let shader_blit_ps = include_bytes!(concat!(env!("OUT_DIR"), "/blit_ps.dxbc"));
-        let hr: HRESULT = device_ref.CreatePixelShader(
+        let hr: HRESULT = device.CreatePixelShader(
             shader_blit_ps.as_ptr() as *const c_void,
             shader_blit_ps.len(),
             null_mut(),
@@ -435,7 +450,7 @@ impl GraphicsD3D11 {
         );
         assert!(hr == S_OK);
 
-        let constants = ComPtr::new(||{
+        let constants = ComPtr::new(|| {
             let desc = D3D11_BUFFER_DESC {
                 ByteWidth: std::mem::size_of::<Constants>() as u32,
                 Usage: D3D11_USAGE_DEFAULT,
@@ -445,9 +460,10 @@ impl GraphicsD3D11 {
                 StructureByteStride: std::mem::size_of::<Constants>() as u32,
             };
             let mut obj = null_mut();
-            let hr = device_ref.CreateBuffer(&desc, std::ptr::null(), &mut obj);
+            let hr = device.CreateBuffer(&desc, std::ptr::null(), &mut obj);
             hresult(obj, hr)
-        }).expect("Failed to create constant buffer");
+        })
+        .expect("Failed to create constant buffer");
 
         let mut smp_linear = null_mut();
         let mut smp_point = null_mut();
@@ -468,23 +484,27 @@ impl GraphicsD3D11 {
 
             {
                 let smp_desc = smp_desc_base.clone();
-                let hr = device_ref.CreateSamplerState(&smp_desc, &mut smp_linear);
+                let hr = device.CreateSamplerState(&smp_desc, &mut smp_linear);
                 assert!(hr == S_OK);
             }
 
             {
                 let mut smp_desc = smp_desc_base.clone();
                 smp_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
-                let hr = device_ref.CreateSamplerState(&smp_desc, &mut smp_point);
+                let hr = device.CreateSamplerState(&smp_desc, &mut smp_point);
                 assert!(hr == S_OK);
             }
         }
 
         let mut result = GraphicsD3D11 {
-            device: ComPtr::from_raw(device),
-            info_queue: if info_queue.is_null() { None } else { Some(ComPtr::from_raw(info_queue)) },
+            device,
+            info_queue: if info_queue.is_null() {
+                None
+            } else {
+                Some(ComPtr::from_raw(info_queue))
+            },
             context: ComPtr::from_raw(context),
-            swapchain: ComPtr::from_raw(swapchain),
+            swapchain,
             backbuffer: None,
             blit_vs: ComPtr::from_raw(blit_vs),
             blit_ps: ComPtr::from_raw(blit_ps),
@@ -499,11 +519,13 @@ impl GraphicsD3D11 {
     }
 
     fn update_backbuffer(&mut self, hwnd: HWND) {
-
-        let new_dim = get_window_client_rect_dimensions(hwnd);
+        let mut new_dim = get_window_client_rect_dimensions(hwnd);
+        let screen_dim = get_screen_dimensions();
+        new_dim.0 = new_dim.0.max(screen_dim.0);
+        new_dim.1 = new_dim.1.max(screen_dim.1);
 
         if let Some(backbuffer) = &self.backbuffer {
-            if backbuffer.dim == new_dim {
+            if backbuffer.dim.0 as i32 >= new_dim.0 && backbuffer.dim.1 as i32 >= new_dim.1 {
                 return;
             }
         }
@@ -519,8 +541,8 @@ impl GraphicsD3D11 {
         let hr: HRESULT = unsafe {
             self.swapchain.ResizeBuffers(
                 NUM_BACK_BUFFERS,
-                new_dim.0,
-                new_dim.1,
+                new_dim.0 as u32,
+                new_dim.1 as u32,
                 BACK_BUFFER_FORMAT,
                 0,
             )
@@ -536,17 +558,14 @@ impl GraphicsD3D11 {
                 &ID3D11Texture2D::uuidof(),
                 &mut tex as *mut *mut ID3D11Texture2D as _,
             );
-            self.device.CreateRenderTargetView(
-                tex as _,
-                null_mut(),
-                &mut rtv,
-            );
+            self.device
+                .CreateRenderTargetView(tex as _, null_mut(), &mut rtv);
         }
 
-        self.backbuffer = Some(BackBuffer{
+        self.backbuffer = Some(BackBuffer {
             tex: unsafe { ComPtr::from_raw(tex) },
             rtv: unsafe { ComPtr::from_raw(rtv) },
-            dim: new_dim,
+            dim: (new_dim.0 as u32, new_dim.1 as u32),
         });
     }
 }
@@ -909,7 +928,6 @@ fn main() {
 
         if let Ok(img) = image_rx.try_recv() {
             if let Ok(img) = img {
-                
                 texture = Some(Texture::new(&graphics.device, img));
 
                 let dim = texture.as_ref().unwrap().dim;
@@ -960,7 +978,10 @@ fn main() {
                 0,
             );
 
-            let backbuffer = graphics.backbuffer.as_ref().expect("Back buffer must be created before rendering a frame");
+            let backbuffer = graphics
+                .backbuffer
+                .as_ref()
+                .expect("Back buffer must be created before rendering a frame");
 
             let rtvs: [*mut ID3D11RenderTargetView; 1] = [backbuffer.rtv.as_ptr()];
             context.OMSetRenderTargets(1, rtvs.as_ptr(), null_mut());
@@ -979,7 +1000,11 @@ fn main() {
             context.ClearRenderTargetView(backbuffer.rtv.as_ptr(), &clear_color);
 
             let cbvs: [*mut ID3D11Buffer; 1] = [graphics.constants.as_ptr()];
-            let srvs: [*mut ID3D11ShaderResourceView; 1] = [if let Some(texture) = &texture { texture.srv.as_ptr() } else { null_mut() }];
+            let srvs: [*mut ID3D11ShaderResourceView; 1] = [if let Some(texture) = &texture {
+                texture.srv.as_ptr()
+            } else {
+                null_mut()
+            }];
             let samplers: [*mut ID3D11SamplerState; 3] = [
                 graphics.smp_linear.as_ptr(), // g_default_sampler
                 graphics.smp_linear.as_ptr(), // g_linear_sampler
