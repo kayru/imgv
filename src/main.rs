@@ -605,6 +605,58 @@ fn get_next_file(path: &Path, direction: StepDirection) -> Option<PathBuf> {
     }
     None
 }
+struct Texture {
+    tex: ComPtr<ID3D11Texture2D>,
+    srv: ComPtr<ID3D11ShaderResourceView>,
+    dim: (u32, u32),
+}
+
+impl Texture {
+    fn new(device: &ComPtr<ID3D11Device>, image: image::DynamicImage) -> Self {
+        let mut image_tex: *mut ID3D11Texture2D = null_mut();
+        let mut image_srv: *mut ID3D11ShaderResourceView = null_mut();
+        let img_buf = image.into_rgba8();
+        let dim = img_buf.dimensions();
+        let img_container = img_buf.as_raw();
+        let texture_desc = D3D11_TEXTURE2D_DESC {
+            Width: dim.0,
+            Height: dim.1,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_IMMUTABLE,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let image_data = D3D11_SUBRESOURCE_DATA {
+            pSysMem: img_container.as_ptr() as *mut c_void,
+            SysMemPitch: 4 * texture_desc.Width,
+            SysMemSlicePitch: 0,
+        };
+        unsafe {
+            device.CreateTexture2D(
+                &texture_desc as *const D3D11_TEXTURE2D_DESC,
+                &image_data as *const D3D11_SUBRESOURCE_DATA,
+                &mut image_tex as *mut *mut ID3D11Texture2D,
+            );
+            device.CreateShaderResourceView(
+                image_tex as *mut ID3D11Resource,
+                null_mut(),
+                &mut image_srv as *mut *mut ID3D11ShaderResourceView,
+            );
+        };
+        Self {
+            tex: unsafe { ComPtr::from_raw(image_tex) },
+            srv: unsafe { ComPtr::from_raw(image_srv) },
+            dim,
+        }
+    }
+}
 
 fn main() {
     let main_begin_time = Instant::now();
@@ -659,8 +711,7 @@ fn main() {
         xfm_viewport_to_image_uv: Transform2D::new_identity().into(),
     };
 
-    let mut image_tex: *mut ID3D11Texture2D = null_mut();
-    let mut image_srv: *mut ID3D11ShaderResourceView = null_mut();
+    let mut texture = None;
     let mut is_resizing = false;
     let mut pending_window_dim = FLOAT2_ONE;
     let mut is_dragging = false;
@@ -858,43 +909,14 @@ fn main() {
 
         if let Ok(img) = image_rx.try_recv() {
             if let Ok(img) = img {
-                let img_buf = img.into_rgba8();
-                let dim = img_buf.dimensions();
-                let img_container = img_buf.as_raw();
+                
+                texture = Some(Texture::new(&graphics.device, img));
+
+                let dim = texture.as_ref().unwrap().dim;
+
                 constants.image_dim.x = dim.0 as f32;
                 constants.image_dim.y = dim.1 as f32;
-                let texture_desc = D3D11_TEXTURE2D_DESC {
-                    Width: dim.0,
-                    Height: dim.1,
-                    MipLevels: 1,
-                    ArraySize: 1,
-                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                    SampleDesc: DXGI_SAMPLE_DESC {
-                        Count: 1,
-                        Quality: 0,
-                    },
-                    Usage: D3D11_USAGE_IMMUTABLE,
-                    BindFlags: D3D11_BIND_SHADER_RESOURCE,
-                    CPUAccessFlags: 0,
-                    MiscFlags: 0,
-                };
-                let image_data = D3D11_SUBRESOURCE_DATA {
-                    pSysMem: img_container.as_ptr() as *mut c_void,
-                    SysMemPitch: 4 * texture_desc.Width,
-                    SysMemSlicePitch: 0,
-                };
-                unsafe {
-                    graphics.device.CreateTexture2D(
-                        &texture_desc as *const D3D11_TEXTURE2D_DESC,
-                        &image_data as *const D3D11_SUBRESOURCE_DATA,
-                        &mut image_tex as *mut *mut ID3D11Texture2D,
-                    );
-                    graphics.device.CreateShaderResourceView(
-                        image_tex as *mut ID3D11Resource,
-                        null_mut(),
-                        &mut image_srv as *mut *mut ID3D11ShaderResourceView,
-                    );
-                };
+
                 let image_load_time = Instant::now() - main_begin_time;
                 println!(
                     "Time to load image {} ({:?})",
@@ -957,7 +979,7 @@ fn main() {
             context.ClearRenderTargetView(backbuffer.rtv.as_ptr(), &clear_color);
 
             let cbvs: [*mut ID3D11Buffer; 1] = [graphics.constants.as_ptr()];
-            let srvs: [*mut ID3D11ShaderResourceView; 1] = [image_srv];
+            let srvs: [*mut ID3D11ShaderResourceView; 1] = [if let Some(texture) = &texture { texture.srv.as_ptr() } else { null_mut() }];
             let samplers: [*mut ID3D11SamplerState; 3] = [
                 graphics.smp_linear.as_ptr(), // g_default_sampler
                 graphics.smp_linear.as_ptr(), // g_linear_sampler
