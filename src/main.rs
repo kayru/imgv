@@ -594,6 +594,12 @@ impl GraphicsD3D11 {
             dim: (new_dim.0 as u32, new_dim.1 as u32),
         });
     }
+
+    fn wait_for_swap_chain(&self) {
+        if let Some(h) = self.swap_chain_waitable {
+            unsafe { winapi::um::synchapi::WaitForSingleObjectEx(h, 1000, 1); }
+        }
+    }
 }
 
 fn decode_mouse_pos(lparam: isize) -> float2 {
@@ -1056,7 +1062,7 @@ fn main() {
             context.ClearState();
 
             graphics.swapchain.Present(0, 0);
-
+            
             draw_end_time = Instant::now();
         };
 
