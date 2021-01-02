@@ -14,6 +14,7 @@ use std::{ffi::OsStr, path::Path, path::PathBuf};
 use winapi::ctypes::c_void;
 use winapi::shared::dxgi::*;
 use winapi::shared::dxgi1_2::*;
+use winapi::shared::dxgi1_3::*;
 use winapi::shared::dxgiformat::*;
 use winapi::shared::dxgitype::*;
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
@@ -32,7 +33,8 @@ mod math;
 use math::*;
 
 const NUM_BACK_BUFFERS: u32 = 2;
-const BACK_BUFFER_FORMAT: u32 = DXGI_FORMAT_R8G8B8A8_UNORM;
+const BACK_BUFFER_FORMAT: u32 = DXGI_FORMAT_B8G8R8A8_UNORM;
+const SWAP_CHAIN_FLAGS: u32 = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
 const WINDOW_MIN_WIDTH: i32 = 320;
 const WINDOW_MIN_HEIGHT: i32 = 240;
@@ -101,7 +103,7 @@ fn get_window_client_rect_dimensions(hwnd: HWND) -> (i32, i32) {
     }
     let dimensions = (
         (client_rect.right - client_rect.left),
-        (client_rect.bottom - client_rect.top)
+        (client_rect.bottom - client_rect.top),
     );
     dimensions
 }
@@ -334,6 +336,17 @@ struct GraphicsD3D11 {
     constants: ComPtr<ID3D11Buffer>,
     smp_linear: ComPtr<ID3D11SamplerState>,
     smp_point: ComPtr<ID3D11SamplerState>,
+    swap_chain_waitable: Option<winapi::shared::ntdef::HANDLE>,
+}
+
+impl Drop for GraphicsD3D11 {
+    fn drop(&mut self) {
+        if let Some(h) = self.swap_chain_waitable {
+            unsafe {
+                winapi::um::handleapi::CloseHandle(h);
+            }
+        }
+    }
 }
 
 impl GraphicsD3D11 {
@@ -357,7 +370,7 @@ impl GraphicsD3D11 {
             Scaling: DXGI_SCALING_NONE,
             SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
             AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-            Flags: 0,
+            Flags: SWAP_CHAIN_FLAGS,
         };
 
         let mut device: *mut ID3D11Device = null_mut();
@@ -414,6 +427,19 @@ impl GraphicsD3D11 {
         );
 
         let swapchain = ComPtr::from_raw(swapchain);
+        let swap_chain_waitable =
+            if let Ok(swapchain2) = swapchain.query_interface::<IDXGISwapChain2>() {
+                swapchain2.SetMaximumFrameLatency(1);
+                let h = swapchain2.GetFrameLatencyWaitableObject();
+                if h == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+                    None
+                } else {
+                    println!("IDXGISwapChain2 waitable object available");
+                    Some(h)
+                }
+            } else {
+                None
+            };
 
         let mut info_queue: *mut ID3D11InfoQueue = null_mut();
 
@@ -511,6 +537,7 @@ impl GraphicsD3D11 {
             constants,
             smp_linear: ComPtr::from_raw(smp_linear),
             smp_point: ComPtr::from_raw(smp_point),
+            swap_chain_waitable,
         };
 
         result.update_backbuffer(hwnd);
@@ -543,7 +570,7 @@ impl GraphicsD3D11 {
                 new_dim.0 as u32,
                 new_dim.1 as u32,
                 BACK_BUFFER_FORMAT,
-                0,
+                SWAP_CHAIN_FLAGS,
             )
         };
         assert!(hr == S_OK);
@@ -676,6 +703,10 @@ impl Texture {
     }
 }
 
+fn to_milliseconds(t: std::time::Duration) -> f32 {
+    t.as_secs_f32() * 1000.0
+}
+
 fn main() {
     let main_begin_time = Instant::now();
 
@@ -707,7 +738,7 @@ fn main() {
 
     {
         let window_time = Instant::now() - main_begin_time;
-        println!("Time to window: {}ms", window_time.as_secs_f32() * 1000.0);
+        println!("Time to window: {}ms", to_milliseconds(window_time));
     }
 
     let mut graphics: GraphicsD3D11 = unsafe { GraphicsD3D11::new(main_window.hwnd).unwrap() };
@@ -753,6 +784,9 @@ fn main() {
             Some(current_image_path.into())
         }
     };
+
+    let mut draw_begin_time = Instant::now();
+    let mut draw_end_time = Instant::now();
 
     while !should_exit {
         if let Some(x) = process_window_messages(&main_window, should_block) {
@@ -929,7 +963,7 @@ fn main() {
                 let image_load_time = Instant::now() - main_begin_time;
                 println!(
                     "Time to load image {} ({:?})",
-                    image_load_time.as_secs_f32() * 1000.0,
+                    to_milliseconds(image_load_time),
                     dim
                 );
                 main_window.set_image_size((dim.0 as i32, dim.1 as i32));
@@ -945,18 +979,22 @@ fn main() {
 
         if frame_number == 0 {
             let init_time = Instant::now() - main_begin_time;
-            println!("Init time: {:.2}ms", init_time.as_secs_f32() * 1000.0);
+            println!("Init time: {:.2}ms", to_milliseconds(init_time));
         }
 
         unsafe {
             let frame_delta_time = Instant::now() - last_frame_draw_time;
             last_frame_draw_time = Instant::now();
+            let draw_time = draw_end_time - draw_begin_time;
             println!(
-                "Draw dt: {:.2}ms, frame_number: {}, handled_events: {}",
-                frame_delta_time.as_secs_f32() * 1000.0,
+                "Draw dt: {:.2}ms, frame_number: {}, handled_events: {}, draw time: {:.2}ms",
+                to_milliseconds(frame_delta_time),
                 frame_number,
-                handled_events
+                handled_events,
+                to_milliseconds(draw_time)
             );
+
+            draw_begin_time = Instant::now();
 
             let context = &graphics.context;
 
@@ -1018,6 +1056,8 @@ fn main() {
             context.ClearState();
 
             graphics.swapchain.Present(0, 0);
+
+            draw_end_time = Instant::now();
         };
 
         frame_number += 1;
