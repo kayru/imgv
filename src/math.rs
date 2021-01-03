@@ -125,6 +125,10 @@ pub fn align_up(i: i32, alignment: i32) -> i32 {
     ((i + alignment - 1) / alignment) * alignment
 }
 
+pub fn float2_round(v: float2) -> float2 {
+    float2::new(v.x as i32 as f32, v.y as i32 as f32)
+}
+
 #[test]
 fn test_align() {
     assert_eq!(align_up(3, 4), 4);

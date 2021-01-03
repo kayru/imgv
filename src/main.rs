@@ -91,6 +91,7 @@ struct Window {
     hwnd: HWND,
     window_style: u32,
     windowed_client_rect: winapi::shared::windef::RECT,
+    window_dim: (i32, i32),
     full_screen: bool,
 }
 
@@ -307,6 +308,7 @@ impl Window {
                 hwnd: data.hwnd,
                 window_style,
                 windowed_client_rect: make_empty_rect(),
+                window_dim,
                 full_screen: false,
             });
         }
@@ -315,6 +317,9 @@ impl Window {
     }
 
     pub fn set_image_size(&mut self, dim: (i32, i32)) {
+        if self.full_screen {
+            self.set_full_screen(false);
+        }
         let mut rect = compute_client_rect(dim);
         unsafe {
             AdjustWindowRect(&mut rect, self.window_style, 0);
@@ -327,6 +332,7 @@ impl Window {
                 rect.bottom - rect.top,
                 0,
             );
+            self.window_dim = dim;
         }
     }
 
@@ -338,6 +344,7 @@ impl Window {
                 SetWindowLongPtrW(self.hwnd, GWL_STYLE, (WS_VISIBLE | WS_POPUP) as isize);
                 SetWindowPos(self.hwnd, HWND_TOP, 0, 0, w, h, SWP_FRAMECHANGED);
             }
+            self.window_dim = (w, h);
             self.full_screen = true;
         } else {
             unsafe {
@@ -346,16 +353,20 @@ impl Window {
                     GWL_STYLE,
                     (WS_VISIBLE | self.window_style) as isize,
                 );
-                let rect = &self.windowed_client_rect;
+                let mut rect = self.windowed_client_rect;
+                AdjustWindowRect(&mut rect, self.window_style, 0);
+                let w = rect.right - rect.left;
+                let h = rect.bottom - rect.top;
                 SetWindowPos(
                     self.hwnd,
                     null_mut(),
-                    rect.left,
-                    rect.top,
-                    rect.right - rect.left,
-                    rect.bottom - rect.top,
+                    self.windowed_client_rect.left,
+                    self.windowed_client_rect.top,
+                    w,
+                    h,
                     SWP_FRAMECHANGED,
                 );
+                self.window_dim = (w, h);
             }
             self.full_screen = false;
         }
@@ -865,6 +876,15 @@ fn main() {
     let mut draw_begin_time = Instant::now();
     let mut draw_end_time = Instant::now();
 
+    let mut _reset_image_transform = || {
+        xfm_window_to_image = Transform2D::new_identity();
+        let window_dim = float2::new(
+            main_window.window_dim.0 as f32,
+            main_window.window_dim.1 as f32,
+        );
+        xfm_window_to_image.offset = 0.5 * constants.image_dim - 0.5 * window_dim;
+    };
+
     while !should_exit {
         if let Some(x) = process_window_messages(&main_window, should_block) {
             should_block = false;
@@ -946,6 +966,12 @@ fn main() {
                                 }
                                 (VK_HOME, _) => {
                                     xfm_window_to_image = Transform2D::new_identity();
+                                    let window_dim = float2::new(
+                                        main_window.window_dim.0 as f32,
+                                        main_window.window_dim.1 as f32,
+                                    );
+                                    xfm_window_to_image.offset =
+                                        0.5 * constants.image_dim - 0.5 * window_dim;
                                 }
                                 (VK_LEFT, _) if image_path.is_some() => {
                                     image_path = switch_to_next_image(
@@ -987,10 +1013,9 @@ fn main() {
                             should_draw = true;
                         }
                         WM_SIZE => {
-                            let width = winapi::shared::minwindef::LOWORD(lparam as u32);
-                            let height = winapi::shared::minwindef::HIWORD(lparam as u32);
-                            constants.window_dim.x = width as f32;
-                            constants.window_dim.y = height as f32;
+                            let width = winapi::shared::minwindef::LOWORD(lparam as u32) as i32;
+                            let height = winapi::shared::minwindef::HIWORD(lparam as u32) as i32;
+                            main_window.window_dim = (width, height);
                             graphics.update_backbuffer(main_window.hwnd);
                             should_draw = true;
                         }
@@ -1027,7 +1052,20 @@ fn main() {
             offset: FLOAT2_ZERO,
         };
 
-        constants.xfm_viewport_to_image_uv = xfm_window_to_image
+        constants.window_dim.x = main_window.window_dim.0 as f32;
+        constants.window_dim.y = main_window.window_dim.1 as f32;
+
+        let xfm_window_to_image_quantized =
+            if xfm_window_to_image.scale.x >= 1.0 || xfm_window_to_image.scale.y >= 1.0 {
+                Transform2D {
+                    scale: xfm_window_to_image.scale,
+                    offset: float2_round(xfm_window_to_image.offset),
+                }
+            } else {
+                xfm_window_to_image
+            };
+
+        constants.xfm_viewport_to_image_uv = xfm_window_to_image_quantized
             .concatenate(xfm_viewport_to_image_uv)
             .into();
 
@@ -1046,8 +1084,15 @@ fn main() {
                     to_milliseconds(image_load_time),
                     dim
                 );
-                main_window.set_image_size((dim.0 as i32, dim.1 as i32));
+                if !main_window.full_screen {
+                    main_window.set_image_size((dim.0 as i32, dim.1 as i32));
+                }
                 xfm_window_to_image = Transform2D::new_identity();
+                let window_dim = float2::new(
+                    main_window.window_dim.0 as f32,
+                    main_window.window_dim.1 as f32,
+                );
+                xfm_window_to_image.offset = 0.5 * constants.image_dim - 0.5 * window_dim;
             } else {
                 println!("Failed to load image: {:?}", img.err());
             };
