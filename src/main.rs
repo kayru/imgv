@@ -32,9 +32,10 @@ use winapi::Interface;
 mod math;
 use math::*;
 
-const NUM_BACK_BUFFERS: u32 = 2;
+const NUM_BACK_BUFFERS: u32 = 3;
 const BACK_BUFFER_FORMAT: u32 = DXGI_FORMAT_B8G8R8A8_UNORM;
-const SWAP_CHAIN_FLAGS: u32 = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+const SWAP_CHAIN_FLAGS: u32 =
+    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT | DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
 
 const WINDOW_MIN_WIDTH: i32 = 320;
 const WINDOW_MIN_HEIGHT: i32 = 240;
@@ -76,10 +77,21 @@ enum WindowMessages {
 
 unsafe impl std::marker::Send for WindowCreatedData {}
 
+fn make_empty_rect() -> winapi::shared::windef::RECT {
+    winapi::shared::windef::RECT {
+        left: 0,
+        right: 0,
+        top: 0,
+        bottom: 0,
+    }
+}
+
 struct Window {
     message_rx: std::sync::mpsc::Receiver<WindowMessages>,
     hwnd: HWND,
     window_style: u32,
+    windowed_client_rect: winapi::shared::windef::RECT,
+    full_screen: bool,
 }
 
 struct WindowThreadState {
@@ -91,16 +103,22 @@ fn get_screen_dimensions() -> (i32, i32) {
     unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
 }
 
-fn get_window_client_rect_dimensions(hwnd: HWND) -> (i32, i32) {
-    let mut client_rect = winapi::shared::windef::RECT {
-        left: 0,
-        right: 0,
-        top: 0,
-        bottom: 0,
-    };
+fn get_client_rect(hwnd: HWND) -> winapi::shared::windef::RECT {
+    let mut client_rect = make_empty_rect();
     unsafe {
+        let mut window_rect = make_empty_rect();
+        GetWindowRect(hwnd, &mut window_rect);
         GetClientRect(hwnd, &mut client_rect);
+        client_rect.left += window_rect.left;
+        client_rect.right += window_rect.left;
+        client_rect.top += window_rect.top;
+        client_rect.bottom += window_rect.top;
     }
+    client_rect
+}
+
+fn get_window_client_rect_dimensions(hwnd: HWND) -> (i32, i32) {
+    let client_rect = get_client_rect(hwnd);
     let dimensions = (
         (client_rect.right - client_rect.left),
         (client_rect.bottom - client_rect.top),
@@ -154,6 +172,11 @@ unsafe extern "system" fn window_proc(
                 mmi.ptMinTrackSize.x = WINDOW_MIN_WIDTH;
                 mmi.ptMinTrackSize.y = WINDOW_MIN_HEIGHT;
             }
+            return 0;
+        }
+        WM_SYSCHAR => {
+            // Ignore Alt + <key> inputs
+            // main_window.set_full_screen(true);
             return 0;
         }
         WM_DROPFILES => {
@@ -283,6 +306,8 @@ impl Window {
                 message_rx: channel_receiver,
                 hwnd: data.hwnd,
                 window_style,
+                windowed_client_rect: make_empty_rect(),
+                full_screen: false,
             });
         }
 
@@ -302,6 +327,37 @@ impl Window {
                 rect.bottom - rect.top,
                 0,
             );
+        }
+    }
+
+    pub fn set_full_screen(&mut self, state: bool) {
+        if state {
+            self.windowed_client_rect = get_client_rect(self.hwnd);
+            let (w, h) = get_screen_dimensions();
+            unsafe {
+                SetWindowLongPtrW(self.hwnd, GWL_STYLE, (WS_VISIBLE | WS_POPUP) as isize);
+                SetWindowPos(self.hwnd, HWND_TOP, 0, 0, w, h, SWP_FRAMECHANGED);
+            }
+            self.full_screen = true;
+        } else {
+            unsafe {
+                SetWindowLongPtrW(
+                    self.hwnd,
+                    GWL_STYLE,
+                    (WS_VISIBLE | self.window_style) as isize,
+                );
+                let rect = &self.windowed_client_rect;
+                SetWindowPos(
+                    self.hwnd,
+                    null_mut(),
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_FRAMECHANGED,
+                );
+            }
+            self.full_screen = false;
         }
     }
 }
@@ -337,6 +393,7 @@ struct GraphicsD3D11 {
     smp_linear: ComPtr<ID3D11SamplerState>,
     smp_point: ComPtr<ID3D11SamplerState>,
     swap_chain_waitable: Option<winapi::shared::ntdef::HANDLE>,
+    frame_statistics: DXGI_FRAME_STATISTICS,
 }
 
 impl Drop for GraphicsD3D11 {
@@ -351,7 +408,9 @@ impl Drop for GraphicsD3D11 {
 
 impl GraphicsD3D11 {
     unsafe fn new(hwnd: HWND) -> Result<Self, ()> {
-        let device_flags = 0u32 | { D3D11_CREATE_DEVICE_DEBUG * cfg!(debug_assertions) as u32 };
+        let device_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | {
+            D3D11_CREATE_DEVICE_DEBUG * cfg!(debug_assertions) as u32
+        };
 
         let feature_levels: D3D_FEATURE_LEVEL = D3D_FEATURE_LEVEL_11_1;
         let num_feature_levels: UINT = 1;
@@ -368,8 +427,8 @@ impl GraphicsD3D11 {
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: NUM_BACK_BUFFERS,
             Scaling: DXGI_SCALING_NONE,
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-            AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, //DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            AlphaMode: DXGI_ALPHA_MODE_UNSPECIFIED,
             Flags: SWAP_CHAIN_FLAGS,
         };
 
@@ -538,6 +597,7 @@ impl GraphicsD3D11 {
             smp_linear: ComPtr::from_raw(smp_linear),
             smp_point: ComPtr::from_raw(smp_point),
             swap_chain_waitable,
+            frame_statistics: std::mem::zeroed(),
         };
 
         result.update_backbuffer(hwnd);
@@ -547,6 +607,7 @@ impl GraphicsD3D11 {
 
     fn update_backbuffer(&mut self, hwnd: HWND) {
         let mut new_dim = get_window_client_rect_dimensions(hwnd);
+
         new_dim.0 = align_up(new_dim.0, 512);
         new_dim.1 = align_up(new_dim.1, 512);
 
@@ -597,7 +658,17 @@ impl GraphicsD3D11 {
 
     fn wait_for_swap_chain(&self) {
         if let Some(h) = self.swap_chain_waitable {
-            unsafe { winapi::um::synchapi::WaitForSingleObjectEx(h, 1000, 1); }
+            unsafe {
+                winapi::um::synchapi::WaitForSingleObject(h, 0xFFFFFFFF);
+            }
+        }
+    }
+
+    fn present(&mut self) {
+        unsafe {
+            self.swapchain.Present(0, DXGI_PRESENT_ALLOW_TEARING);
+            self.swapchain
+                .GetFrameStatistics(&mut self.frame_statistics);
         }
     }
 }
@@ -888,6 +959,9 @@ fn main() {
                                         StepDirection::Forward,
                                     );
                                 }
+                                (VK_RETURN, _) => {
+                                    main_window.set_full_screen(!main_window.full_screen);
+                                }
                                 (_, '1') => {
                                     let s = 1.0;
                                     xfm_window_to_image.scale = float2::new(s, s);
@@ -1061,8 +1135,8 @@ fn main() {
 
             context.ClearState();
 
-            graphics.swapchain.Present(0, 0);
-            
+            graphics.present();
+
             draw_end_time = Instant::now();
         };
 
