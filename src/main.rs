@@ -106,6 +106,22 @@ fn get_screen_dimensions() -> (i32, i32) {
     unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
 }
 
+fn get_client_rect_absolute(hwnd: HWND) -> winapi::shared::windef::RECT {
+    let mut client_rect = make_empty_rect();
+    unsafe {
+        GetClientRect(hwnd, &mut client_rect);
+    }
+    client_rect
+}
+
+fn get_window_rect_absolute(hwnd: HWND) -> winapi::shared::windef::RECT {
+    let mut window_rect = make_empty_rect();
+    unsafe {
+        GetWindowRect(hwnd, &mut window_rect);
+    }
+    window_rect
+}
+
 fn get_client_rect(hwnd: HWND) -> winapi::shared::windef::RECT {
     let mut client_rect = make_empty_rect();
     unsafe {
