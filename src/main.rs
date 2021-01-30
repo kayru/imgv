@@ -32,6 +32,8 @@ use winapi::Interface;
 mod math;
 use math::*;
 
+const VERBOSE_LOG: bool = false;
+
 const NUM_BACK_BUFFERS: u32 = 3;
 const BACK_BUFFER_FORMAT: u32 = DXGI_FORMAT_B8G8R8A8_UNORM;
 const SWAP_CHAIN_FLAGS: u32 =
@@ -290,9 +292,8 @@ impl Window {
                     // Delay showing this window until D3D is ready to draw something
                     // ShowWindow(hwnd, SW_SHOW);
 
-                    let mut msg: MSG = std::mem::zeroed();
-
                     while !window_state.is_window_closed {
+                        let mut msg: MSG = std::mem::zeroed();
                         if GetMessageW(&mut msg, hwnd, 0, 0) > 0 {
                             TranslateMessage(&msg);
                             DispatchMessageW(&msg);
@@ -1108,16 +1109,18 @@ fn main() {
         }
 
         unsafe {
-            let frame_delta_time = Instant::now() - last_frame_draw_time;
-            last_frame_draw_time = Instant::now();
-            let draw_time = draw_end_time - draw_begin_time;
-            println!(
-                "Draw dt: {:.2}ms, frame_number: {}, handled_events: {}, draw time: {:.2}ms",
-                to_milliseconds(frame_delta_time),
-                frame_number,
-                handled_events,
-                to_milliseconds(draw_time)
-            );
+            if VERBOSE_LOG {
+                let frame_delta_time = Instant::now() - last_frame_draw_time;
+                last_frame_draw_time = Instant::now();
+                let draw_time = draw_end_time - draw_begin_time;
+                println!(
+                    "Draw dt: {:.2}ms, frame_number: {}, handled_events: {}, draw time: {:.2}ms",
+                    to_milliseconds(frame_delta_time),
+                    frame_number,
+                    handled_events,
+                    to_milliseconds(draw_time)
+                );
+            }
 
             draw_begin_time = Instant::now();
 
