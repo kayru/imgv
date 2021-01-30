@@ -2,14 +2,13 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
-//use std::time::{Duration};
 use cgmath::{assert_ulps_eq, prelude::*};
 use com_ptr::{hresult, ComPtr};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::prelude::*;
 use std::ptr::null_mut;
-use std::time::Instant;
+use std::time::{Instant, Duration};
 use std::{ffi::OsStr, path::Path, path::PathBuf};
 use winapi::ctypes::c_void;
 use winapi::shared::dxgi::*;
@@ -61,6 +60,7 @@ struct WindowCreatedData {
 }
 
 struct NativeMessageData {
+    timestamp: Instant,
     msg: UINT,
     wparam: WPARAM,
     lparam: LPARAM,
@@ -224,14 +224,14 @@ unsafe extern "system" fn window_proc(
         }
         _ => {
             if let Some(window_state) = window_state {
-                window_state
+                let _ = window_state
                     .message_tx
                     .send(WindowMessages::NativeMessage(NativeMessageData {
+                        timestamp: Instant::now(),
                         msg,
                         wparam,
                         lparam,
-                    }))
-                    .unwrap();
+                    }));
             }
         }
     };
@@ -310,7 +310,7 @@ impl Window {
 
                     while !window_state.is_window_closed {
                         let mut msg: MSG = std::mem::zeroed();
-                        if GetMessageW(&mut msg, hwnd, 0, 0) > 0 {
+                        if GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
                             TranslateMessage(&msg);
                             DispatchMessageW(&msg);
                         }
@@ -391,7 +391,9 @@ impl Window {
 }
 
 fn process_window_messages(window: &Window, should_block: bool) -> Option<WindowMessages> {
+    profiling::scope!("RcvWindowMessages");
     if should_block {
+        profiling::scope!("Block");
         if let Ok(x) = window.message_rx.recv() {
             return Some(x);
         }
@@ -693,8 +695,15 @@ impl GraphicsD3D11 {
     }
 
     fn present(&mut self) {
+        profiling::scope!("Present");
         unsafe {
-            self.swapchain.Present(0, DXGI_PRESENT_ALLOW_TEARING);
+            let params = DXGI_PRESENT_PARAMETERS {
+                DirtyRectsCount: 0,
+                pDirtyRects: null_mut(),
+                pScrollRect: null_mut(),
+                pScrollOffset: null_mut()
+            };
+            self.swapchain.Present1(0, DXGI_PRESENT_ALLOW_TEARING, &params);
             self.swapchain
                 .GetFrameStatistics(&mut self.frame_statistics);
         }
@@ -808,11 +817,46 @@ impl Texture {
     }
 }
 
-fn to_milliseconds(t: std::time::Duration) -> f32 {
+fn to_milliseconds(t: Duration) -> f32 {
     t.as_secs_f32() * 1000.0
 }
 
+struct ViewerState {
+    texture: Option<Texture>,
+    frame_number : u32,
+    is_resizing: bool,
+    is_dragging: bool,
+    drag_origin: float2,
+    mouse_pos: float2,
+    viewport_dim: float2,
+    image_dim: float2,
+    xfm_window_to_image: Transform2D,
+}
+
+impl ViewerState {
+    fn new() -> Self {
+        Self {
+            texture: None,
+            frame_number: 0,
+            is_resizing: false,
+            is_dragging: false,
+            drag_origin: FLOAT2_ZERO,
+            mouse_pos: FLOAT2_ZERO,
+            viewport_dim: FLOAT2_ZERO,
+            image_dim: FLOAT2_ZERO,
+            xfm_window_to_image: Transform2D::new_identity(),
+        }
+    }
+
+    fn reset_image_transform(&mut self) {        
+        self.xfm_window_to_image = Transform2D::new_identity();
+        self.xfm_window_to_image.offset = 0.5 * self.image_dim - 0.5 * self.viewport_dim;
+    }
+}
+
 fn main() {
+    profiling::register_thread!("main");
+    
     let main_begin_time = Instant::now();
 
     let mut image_path: Option<PathBuf> = None;
@@ -827,13 +871,17 @@ fn main() {
         load_req_tx.send(path).unwrap();
     }
 
+    let mut state = ViewerState::new();
+
     let mut main_window: Window = Window::new((500, 500)).unwrap();
     let main_window_handle = main_window.hwnd as u64;
     std::thread::spawn(move || {
         while let Ok(x) = load_req_rx.recv() {
+            profiling::scope!("LoadImage");
+            let load_begin_time = Instant::now();
             println!("Loading image {:?}", x);
             let img = image::open(x);
-            let _ = image_tx.send(img);
+            let _ = image_tx.send((img, load_begin_time));
             unsafe {
                 InvalidateRect(main_window_handle as HWND, null_mut(), 1);
             }
@@ -843,7 +891,7 @@ fn main() {
 
     {
         let window_time = Instant::now() - main_begin_time;
-        println!("Time to window: {}ms", to_milliseconds(window_time));
+        println!("Time to window: {} ms", to_milliseconds(window_time));
     }
 
     let mut graphics: GraphicsD3D11 = unsafe { GraphicsD3D11::new(main_window.hwnd).unwrap() };
@@ -855,26 +903,12 @@ fn main() {
         SetForegroundWindow(hwnd);
     }
 
-    let mut should_exit = false;
-    let mut frame_number = 0;
-
     let mut constants = Constants {
         image_dim: FLOAT2_ZERO,
         window_dim: FLOAT2_ZERO,
         mouse: FLOAT4_ZERO,
         xfm_viewport_to_image_uv: Transform2D::new_identity().into(),
     };
-
-    let mut texture = None;
-    let mut _is_resizing = false;
-    let mut is_dragging = false;
-    let mut drag_origin = FLOAT2_ZERO;
-    let mut mouse_pos = FLOAT2_ZERO;
-    let mut should_draw = true;
-    let mut should_block = true;
-    let mut xfm_window_to_image = Transform2D::new_identity();
-    let mut handled_events = 0;
-    let mut last_frame_draw_time = Instant::now();
 
     let switch_to_next_image = |current_image_path: &Path, direction: StepDirection| {
         let file_name = get_next_file(current_image_path, direction);
@@ -892,17 +926,14 @@ fn main() {
 
     let mut draw_begin_time = Instant::now();
     let mut draw_end_time = Instant::now();
-
-    let mut _reset_image_transform = || {
-        xfm_window_to_image = Transform2D::new_identity();
-        let window_dim = float2::new(
-            main_window.window_dim.0 as f32,
-            main_window.window_dim.1 as f32,
-        );
-        xfm_window_to_image.offset = 0.5 * constants.image_dim - 0.5 * window_dim;
-    };
-
+    let mut last_frame_draw_time = Instant::now();
+    let mut should_draw = true;
+    let mut should_block = true;
+    let mut should_exit =false;
+    let mut handled_events = 0;
+    let mut last_verbose_log_time = Instant::now();
     while !should_exit {
+        profiling::scope!("MainLoop");
         if let Some(x) = process_window_messages(&main_window, should_block) {
             should_block = false;
             match x {
@@ -914,6 +945,13 @@ fn main() {
                     should_exit = true;
                 }
                 WindowMessages::NativeMessage(native_msg) => {
+                    let latency = Instant::now() - native_msg.timestamp;
+                    let time_since_verbose_log = Instant::now() - last_verbose_log_time;
+                    if latency > Duration::from_millis(5) && time_since_verbose_log > Duration::from_millis(100) {
+                        profiling::scope!("Hitch", format!("{} ms", to_milliseconds(latency)).as_str());
+                        println!("Hitch: {} ms", to_milliseconds(latency));
+                        last_verbose_log_time = Instant::now();
+                    }
                     let lparam = native_msg.lparam;
                     let wparam = native_msg.wparam;
                     match native_msg.msg {
@@ -927,20 +965,20 @@ fn main() {
                             } else {
                                 float2::new(1.2, 1.2)
                             };
-                            let mouse_pos_img = xfm_window_to_image.transform_point(mouse_pos);
+                            let mouse_pos_img = state.xfm_window_to_image.transform_point(state.mouse_pos);
                             let zoom_transform = Transform2D::new_translate(-mouse_pos_img)
                                 .concatenate(Transform2D::new_scale(zoom))
                                 .concatenate(Transform2D::new_translate(mouse_pos_img));
-                            xfm_window_to_image.inplace_concatenate(zoom_transform);
+                            state.xfm_window_to_image.inplace_concatenate(zoom_transform);
                             should_draw = true;
-                            is_dragging = false;
+                            state.is_dragging = false;
                         }
                         WM_LBUTTONDOWN => {
-                            is_dragging = true;
-                            drag_origin = mouse_pos - xfm_window_to_image.inverse().offset;
+                            state.is_dragging = true;
+                            state.drag_origin = state.mouse_pos - state.xfm_window_to_image.inverse().offset;
                         }
                         WM_LBUTTONUP => {
-                            is_dragging = false;
+                            state.is_dragging = false;
                         }
                         WM_XBUTTONDOWN | WM_XBUTTONDBLCLK => {
                             let button_index = winapi::shared::minwindef::HIWORD(wparam as u32);
@@ -966,13 +1004,13 @@ fn main() {
                             // println!("WM_XBUTTONUP");
                         }
                         WM_MOUSEMOVE => {
-                            mouse_pos = decode_mouse_pos(lparam);
-                            constants.mouse.x = mouse_pos.x;
-                            constants.mouse.y = mouse_pos.y;
-                            let drag_delta: float2 = drag_origin - mouse_pos;
-                            if is_dragging {
-                                xfm_window_to_image.offset =
-                                    drag_delta.mul_element_wise(xfm_window_to_image.scale);
+                            state.mouse_pos = decode_mouse_pos(lparam);
+                            constants.mouse.x = state.mouse_pos.x;
+                            constants.mouse.y = state.mouse_pos.y;
+                            let drag_delta: float2 = state.drag_origin - state.mouse_pos;
+                            if state.is_dragging {
+                                state.xfm_window_to_image.offset =
+                                    drag_delta.mul_element_wise(state.xfm_window_to_image.scale);
                                 should_draw = true;
                             }
                         }
@@ -982,12 +1020,12 @@ fn main() {
                                     should_exit = true;
                                 }
                                 (VK_HOME, _) => {
-                                    xfm_window_to_image = Transform2D::new_identity();
+                                    state.xfm_window_to_image = Transform2D::new_identity();
                                     let window_dim = float2::new(
                                         main_window.window_dim.0 as f32,
                                         main_window.window_dim.1 as f32,
                                     );
-                                    xfm_window_to_image.offset =
+                                    state.xfm_window_to_image.offset =
                                         0.5 * constants.image_dim - 0.5 * window_dim;
                                 }
                                 (VK_LEFT, _) if image_path.is_some() => {
@@ -1007,23 +1045,23 @@ fn main() {
                                 }
                                 (_, '1') => {
                                     let s = 1.0;
-                                    xfm_window_to_image.scale = float2::new(s, s);
+                                    state.xfm_window_to_image.scale = float2::new(s, s);
                                 }
                                 (_, '2') => {
                                     let s = 1.0 / 2.0;
-                                    xfm_window_to_image.scale = float2::new(s, s);
+                                    state.xfm_window_to_image.scale = float2::new(s, s);
                                 }
                                 (_, '3') => {
                                     let s = 1.0 / 4.0;
-                                    xfm_window_to_image.scale = float2::new(s, s);
+                                    state.xfm_window_to_image.scale = float2::new(s, s);
                                 }
                                 (_, '4') => {
                                     let s = 1.0 / 8.0;
-                                    xfm_window_to_image.scale = float2::new(s, s);
+                                    state.xfm_window_to_image.scale = float2::new(s, s);
                                 }
                                 (_, '5') => {
                                     let s = 1.0 / 16.0;
-                                    xfm_window_to_image.scale = float2::new(s, s);
+                                    state.xfm_window_to_image.scale = float2::new(s, s);
                                 }
                                 _ => {}
                             }
@@ -1037,11 +1075,11 @@ fn main() {
                             should_draw = true;
                         }
                         WM_ENTERSIZEMOVE => {
-                            _is_resizing = true;
+                            state.is_resizing = true;
                         }
                         WM_EXITSIZEMOVE => {
                             should_draw = true;
-                            _is_resizing = false;
+                            state.is_resizing = false;
                         }
                         _ => {
                             // println!("msg: {}", native_msg.msg);
@@ -1073,43 +1111,43 @@ fn main() {
         constants.window_dim.y = main_window.window_dim.1 as f32;
 
         let xfm_window_to_image_quantized =
-            if xfm_window_to_image.scale.x >= 1.0 || xfm_window_to_image.scale.y >= 1.0 {
+            if state.xfm_window_to_image.scale.x >= 1.0 || state.xfm_window_to_image.scale.y >= 1.0 {
                 Transform2D {
-                    scale: xfm_window_to_image.scale,
-                    offset: float2_round(xfm_window_to_image.offset),
+                    scale: state.xfm_window_to_image.scale,
+                    offset: float2_round(state.xfm_window_to_image.offset),
                 }
             } else {
-                xfm_window_to_image
+                state.xfm_window_to_image
             };
 
         constants.xfm_viewport_to_image_uv = xfm_window_to_image_quantized
             .concatenate(xfm_viewport_to_image_uv)
             .into();
 
-        if let Ok(img) = image_rx.try_recv() {
+        if let Ok((img, load_begin_time)) = image_rx.try_recv() {
             if let Ok(img) = img {
-                texture = Some(Texture::new(&graphics.device, img));
+                state.texture = Some(Texture::new(&graphics.device, img));
 
-                let dim = texture.as_ref().unwrap().dim;
+                let dim = state.texture.as_ref().unwrap().dim;
 
                 constants.image_dim.x = dim.0 as f32;
                 constants.image_dim.y = dim.1 as f32;
 
-                let image_load_time = Instant::now() - main_begin_time;
+                let image_load_time = Instant::now() - load_begin_time;
                 println!(
-                    "Time to load image {} ({:?})",
+                    "Time to load image {} ms ({:?})",
                     to_milliseconds(image_load_time),
                     dim
                 );
                 if !main_window.full_screen {
                     main_window.set_image_size((dim.0 as i32, dim.1 as i32));
                 }
-                xfm_window_to_image = Transform2D::new_identity();
+                state.xfm_window_to_image = Transform2D::new_identity();
                 let window_dim = float2::new(
                     main_window.window_dim.0 as f32,
                     main_window.window_dim.1 as f32,
                 );
-                xfm_window_to_image.offset = 0.5 * constants.image_dim - 0.5 * window_dim;
+                state.xfm_window_to_image.offset = 0.5 * constants.image_dim - 0.5 * window_dim;
             } else {
                 println!("Failed to load image: {:?}", img.err());
             };
@@ -1119,12 +1157,14 @@ fn main() {
             }
         }
 
-        if frame_number == 0 {
+        if state.frame_number == 0 {
             let init_time = Instant::now() - main_begin_time;
             println!("Init time: {:.2}ms", to_milliseconds(init_time));
         }
 
         unsafe {
+            profiling::scope!("Draw");
+
             if VERBOSE_LOG {
                 let frame_delta_time = Instant::now() - last_frame_draw_time;
                 last_frame_draw_time = Instant::now();
@@ -1132,7 +1172,7 @@ fn main() {
                 println!(
                     "Draw dt: {:.2}ms, frame_number: {}, handled_events: {}, draw time: {:.2}ms",
                     to_milliseconds(frame_delta_time),
-                    frame_number,
+                    state.frame_number,
                     handled_events,
                     to_milliseconds(draw_time)
                 );
@@ -1173,7 +1213,7 @@ fn main() {
             context.ClearRenderTargetView(backbuffer.rtv.as_ptr(), &clear_color);
 
             let cbvs: [*mut ID3D11Buffer; 1] = [graphics.constants.as_ptr()];
-            let srvs: [*mut ID3D11ShaderResourceView; 1] = [if let Some(texture) = &texture {
+            let srvs: [*mut ID3D11ShaderResourceView; 1] = [if let Some(texture) = &state.texture {
                 texture.srv.as_ptr()
             } else {
                 null_mut()
@@ -1202,9 +1242,10 @@ fn main() {
             graphics.present();
 
             draw_end_time = Instant::now();
+            profiling::finish_frame!();
         };
 
-        frame_number += 1;
+        state.frame_number += 1;
         should_draw = false;
         handled_events = 0;
     }
