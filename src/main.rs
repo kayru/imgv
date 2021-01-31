@@ -18,7 +18,7 @@ use winapi::shared::dxgiformat::*;
 use winapi::shared::dxgitype::*;
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::ntdef::{HRESULT, LPCWSTR};
-use winapi::shared::windef::{HBRUSH, HICON, HMENU, HWND};
+use winapi::shared::windef::{HBRUSH, HICON, HMENU, HWND, RECT};
 use winapi::shared::windowsx::{GET_X_LPARAM, GET_Y_LPARAM};
 use winapi::shared::winerror::S_OK;
 use winapi::um::d3d11::*;
@@ -79,8 +79,8 @@ enum WindowMessages {
 
 unsafe impl std::marker::Send for WindowCreatedData {}
 
-fn make_empty_rect() -> winapi::shared::windef::RECT {
-    winapi::shared::windef::RECT {
+fn make_empty_rect() -> RECT {
+    RECT {
         left: 0,
         right: 0,
         top: 0,
@@ -92,8 +92,8 @@ struct Window {
     message_rx: std::sync::mpsc::Receiver<WindowMessages>,
     hwnd: HWND,
     window_style: u32,
-    window_rect: winapi::shared::windef::RECT,
-    windowed_client_rect: winapi::shared::windef::RECT,
+    window_rect: RECT,
+    windowed_client_rect: RECT,
     window_dim: (i32, i32),
     full_screen: bool,
 }
@@ -107,7 +107,7 @@ fn get_screen_dimensions() -> (i32, i32) {
     unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
 }
 
-fn get_client_rect_absolute(hwnd: HWND) -> winapi::shared::windef::RECT {
+fn get_client_rect_absolute(hwnd: HWND) -> RECT {
     let mut client_rect = make_empty_rect();
     unsafe {
         GetClientRect(hwnd, &mut client_rect);
@@ -115,7 +115,7 @@ fn get_client_rect_absolute(hwnd: HWND) -> winapi::shared::windef::RECT {
     client_rect
 }
 
-fn get_window_rect_absolute(hwnd: HWND) -> winapi::shared::windef::RECT {
+fn get_window_rect_absolute(hwnd: HWND) -> RECT {
     let mut window_rect = make_empty_rect();
     unsafe {
         GetWindowRect(hwnd, &mut window_rect);
@@ -123,7 +123,7 @@ fn get_window_rect_absolute(hwnd: HWND) -> winapi::shared::windef::RECT {
     window_rect
 }
 
-fn get_client_rect(hwnd: HWND) -> winapi::shared::windef::RECT {
+fn get_client_rect(hwnd: HWND) -> RECT {
     let mut client_rect = make_empty_rect();
     unsafe {
         let mut window_rect = make_empty_rect();
@@ -146,10 +146,10 @@ fn get_window_client_rect_dimensions(hwnd: HWND) -> (i32, i32) {
     dimensions
 }
 
-fn compute_client_rect(dim: (i32, i32)) -> winapi::shared::windef::RECT {
+fn compute_client_rect(dim: (i32, i32)) -> RECT {
     let screen_dim = get_screen_dimensions();
     let window_pos = (screen_dim.0 / 2 - dim.0 / 2, screen_dim.1 / 2 - dim.1 / 2);
-    winapi::shared::windef::RECT {
+    RECT {
         left: window_pos.0,
         top: window_pos.1,
         right: window_pos.0 + dim.0,
@@ -460,7 +460,8 @@ impl GraphicsD3D11 {
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: NUM_BACK_BUFFERS,
             Scaling: DXGI_SCALING_NONE,
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, //DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+            //SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
             AlphaMode: DXGI_ALPHA_MODE_UNSPECIFIED,
             Flags: SWAP_CHAIN_FLAGS,
         };
@@ -1095,10 +1096,6 @@ fn main() {
                             );
                             if edge_delta != FLOAT2_ZERO {
                                 state.xfm_window_to_image.offset += edge_delta.mul_element_wise(state.xfm_window_to_image.scale);
-                                should_draw = true;
-                                unsafe {
-                                    InvalidateRect(main_window_handle as HWND, null_mut(), 1);
-                                }
                             }
                             main_window.window_rect = new_window_rect;
                             graphics.update_backbuffer(main_window.hwnd);
