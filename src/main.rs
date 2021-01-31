@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::prelude::*;
 use std::ptr::null_mut;
-use std::time::{Instant, Duration};
+use std::time::{Duration, Instant};
 use std::{ffi::OsStr, path::Path, path::PathBuf};
 use winapi::ctypes::c_void;
 use winapi::shared::dxgi::*;
@@ -92,6 +92,7 @@ struct Window {
     message_rx: std::sync::mpsc::Receiver<WindowMessages>,
     hwnd: HWND,
     window_style: u32,
+    window_rect: winapi::shared::windef::RECT,
     windowed_client_rect: winapi::shared::windef::RECT,
     window_dim: (i32, i32),
     full_screen: bool,
@@ -224,14 +225,14 @@ unsafe extern "system" fn window_proc(
         }
         _ => {
             if let Some(window_state) = window_state {
-                let _ = window_state
-                    .message_tx
-                    .send(WindowMessages::NativeMessage(NativeMessageData {
+                let _ = window_state.message_tx.send(WindowMessages::NativeMessage(
+                    NativeMessageData {
                         timestamp: Instant::now(),
                         msg,
                         wparam,
                         lparam,
-                    }));
+                    },
+                ));
             }
         }
     };
@@ -324,7 +325,8 @@ impl Window {
                 message_rx: channel_receiver,
                 hwnd: data.hwnd,
                 window_style,
-                windowed_client_rect: make_empty_rect(),
+                window_rect: get_window_rect_absolute(data.hwnd),
+                windowed_client_rect: get_client_rect(data.hwnd),
                 window_dim,
                 full_screen: false,
             });
@@ -350,6 +352,7 @@ impl Window {
                 0,
             );
             self.window_dim = dim;
+            self.window_rect = get_window_rect_absolute(self.hwnd);
         }
     }
 
@@ -700,7 +703,7 @@ impl GraphicsD3D11 {
                 DirtyRectsCount: 0,
                 pDirtyRects: null_mut(),
                 pScrollRect: null_mut(),
-                pScrollOffset: null_mut()
+                pScrollOffset: null_mut(),
             };
             let flags = if sync_interval == 0 {
                 DXGI_PRESENT_ALLOW_TEARING
@@ -827,7 +830,7 @@ fn to_milliseconds(t: Duration) -> f32 {
 
 struct ViewerState {
     texture: Option<Texture>,
-    frame_number : u32,
+    frame_number: u32,
     is_resizing: bool,
     is_dragging: bool,
     drag_origin: float2,
@@ -852,7 +855,7 @@ impl ViewerState {
         }
     }
 
-    fn reset_image_transform(&mut self) {        
+    fn reset_image_transform(&mut self) {
         self.xfm_window_to_image = Transform2D::new_identity();
         self.xfm_window_to_image.offset = 0.5 * self.image_dim - 0.5 * self.viewport_dim;
     }
@@ -860,7 +863,7 @@ impl ViewerState {
 
 fn main() {
     profiling::register_thread!("main");
-    
+
     let main_begin_time = Instant::now();
 
     let mut image_path: Option<PathBuf> = None;
@@ -933,7 +936,7 @@ fn main() {
     let mut last_frame_draw_time = Instant::now();
     let mut should_draw = true;
     let mut should_block = true;
-    let mut should_exit =false;
+    let mut should_exit = false;
     let mut handled_events = 0;
     let mut last_verbose_log_time = Instant::now();
     while !should_exit {
@@ -951,8 +954,13 @@ fn main() {
                 WindowMessages::NativeMessage(native_msg) => {
                     let latency = Instant::now() - native_msg.timestamp;
                     let time_since_verbose_log = Instant::now() - last_verbose_log_time;
-                    if latency > Duration::from_millis(20) && time_since_verbose_log > Duration::from_millis(100) {
-                        profiling::scope!("Hitch", format!("{} ms", to_milliseconds(latency)).as_str());
+                    if latency > Duration::from_millis(20)
+                        && time_since_verbose_log > Duration::from_millis(100)
+                    {
+                        profiling::scope!(
+                            "Hitch",
+                            format!("{} ms", to_milliseconds(latency)).as_str()
+                        );
                         println!("Hitch: {} ms", to_milliseconds(latency));
                         last_verbose_log_time = Instant::now();
                     }
@@ -969,17 +977,21 @@ fn main() {
                             } else {
                                 float2::new(1.2, 1.2)
                             };
-                            let mouse_pos_img = state.xfm_window_to_image.transform_point(state.mouse_pos);
+                            let mouse_pos_img =
+                                state.xfm_window_to_image.transform_point(state.mouse_pos);
                             let zoom_transform = Transform2D::new_translate(-mouse_pos_img)
                                 .concatenate(Transform2D::new_scale(zoom))
                                 .concatenate(Transform2D::new_translate(mouse_pos_img));
-                            state.xfm_window_to_image.inplace_concatenate(zoom_transform);
+                            state
+                                .xfm_window_to_image
+                                .inplace_concatenate(zoom_transform);
                             should_draw = true;
                             state.is_dragging = false;
                         }
                         WM_LBUTTONDOWN => {
                             state.is_dragging = true;
-                            state.drag_origin = state.mouse_pos - state.xfm_window_to_image.inverse().offset;
+                            state.drag_origin =
+                                state.mouse_pos - state.xfm_window_to_image.inverse().offset;
                         }
                         WM_LBUTTONUP => {
                             state.is_dragging = false;
@@ -1076,6 +1088,19 @@ fn main() {
                             let height = winapi::shared::minwindef::HIWORD(lparam as u32) as i32;
                             state.viewport_dim = float2::new(width as f32, height as f32);
                             main_window.window_dim = (width, height);
+                            let new_window_rect = get_window_rect_absolute(main_window.hwnd);
+                            let edge_delta = float2::new(
+                                (new_window_rect.left - main_window.window_rect.left) as f32,
+                                (new_window_rect.top - main_window.window_rect.top) as f32,
+                            );
+                            if edge_delta != FLOAT2_ZERO {
+                                state.xfm_window_to_image.offset += edge_delta.mul_element_wise(state.xfm_window_to_image.scale);
+                                should_draw = true;
+                                unsafe {
+                                    InvalidateRect(main_window_handle as HWND, null_mut(), 1);
+                                }
+                            }
+                            main_window.window_rect = new_window_rect;
                             graphics.update_backbuffer(main_window.hwnd);
                             should_draw = true;
                         }
@@ -1115,15 +1140,16 @@ fn main() {
         constants.window_dim.x = main_window.window_dim.0 as f32;
         constants.window_dim.y = main_window.window_dim.1 as f32;
 
-        let xfm_window_to_image_quantized =
-            if state.xfm_window_to_image.scale.x >= 1.0 || state.xfm_window_to_image.scale.y >= 1.0 {
-                Transform2D {
-                    scale: state.xfm_window_to_image.scale,
-                    offset: float2_round(state.xfm_window_to_image.offset),
-                }
-            } else {
-                state.xfm_window_to_image
-            };
+        let xfm_window_to_image_quantized = if state.xfm_window_to_image.scale.x >= 1.0
+            || state.xfm_window_to_image.scale.y >= 1.0
+        {
+            Transform2D {
+                scale: state.xfm_window_to_image.scale,
+                offset: float2_round(state.xfm_window_to_image.offset),
+            }
+        } else {
+            state.xfm_window_to_image
+        };
 
         constants.xfm_viewport_to_image_uv = xfm_window_to_image_quantized
             .concatenate(xfm_viewport_to_image_uv)
@@ -1218,11 +1244,12 @@ fn main() {
             context.ClearRenderTargetView(backbuffer.rtv.as_ptr(), &clear_color);
 
             let cbvs: [*mut ID3D11Buffer; 1] = [graphics.constants.as_ptr()];
-            let srvs: [*mut ID3D11ShaderResourceView; 1] = [if let Some(texture) = &state.texture {
-                texture.srv.as_ptr()
-            } else {
-                null_mut()
-            }];
+            let srvs: [*mut ID3D11ShaderResourceView; 1] =
+                [if let Some(texture) = &state.texture {
+                    texture.srv.as_ptr()
+                } else {
+                    null_mut()
+                }];
             let samplers: [*mut ID3D11SamplerState; 3] = [
                 graphics.smp_linear.as_ptr(), // g_default_sampler
                 graphics.smp_linear.as_ptr(), // g_linear_sampler
