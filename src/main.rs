@@ -694,7 +694,7 @@ impl GraphicsD3D11 {
         }
     }
 
-    fn present(&mut self) {
+    fn present(&mut self, sync_interval: u32) {
         profiling::scope!("Present");
         unsafe {
             let params = DXGI_PRESENT_PARAMETERS {
@@ -703,7 +703,12 @@ impl GraphicsD3D11 {
                 pScrollRect: null_mut(),
                 pScrollOffset: null_mut()
             };
-            self.swapchain.Present1(0, DXGI_PRESENT_ALLOW_TEARING, &params);
+            let flags = if sync_interval == 0 {
+                DXGI_PRESENT_ALLOW_TEARING
+            } else {
+                0u32
+            };
+            self.swapchain.Present1(sync_interval, flags, &params);
             self.swapchain
                 .GetFrameStatistics(&mut self.frame_statistics);
         }
@@ -947,7 +952,7 @@ fn main() {
                 WindowMessages::NativeMessage(native_msg) => {
                     let latency = Instant::now() - native_msg.timestamp;
                     let time_since_verbose_log = Instant::now() - last_verbose_log_time;
-                    if latency > Duration::from_millis(5) && time_since_verbose_log > Duration::from_millis(100) {
+                    if latency > Duration::from_millis(20) && time_since_verbose_log > Duration::from_millis(100) {
                         profiling::scope!("Hitch", format!("{} ms", to_milliseconds(latency)).as_str());
                         println!("Hitch: {} ms", to_milliseconds(latency));
                         last_verbose_log_time = Instant::now();
@@ -1011,8 +1016,8 @@ fn main() {
                             if state.is_dragging {
                                 state.xfm_window_to_image.offset =
                                     drag_delta.mul_element_wise(state.xfm_window_to_image.scale);
-                                should_draw = true;
                             }
+                            should_draw = true;
                         }
                         WM_KEYDOWN => {
                             match (wparam as i32, wparam as u8 as char) {
@@ -1239,7 +1244,8 @@ fn main() {
 
             context.ClearState();
 
-            graphics.present();
+            let present_interval = if state.is_dragging { 0 } else { 1 };
+            graphics.present(present_interval);
 
             draw_end_time = Instant::now();
             profiling::finish_frame!();
