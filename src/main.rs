@@ -518,7 +518,6 @@ impl GraphicsD3D11 {
         let swapchain = ComPtr::from_raw(swapchain);
         let swap_chain_waitable =
             if let Ok(swapchain2) = swapchain.query_interface::<IDXGISwapChain2>() {
-                swapchain2.SetMaximumFrameLatency(1);
                 let h = swapchain2.GetFrameLatencyWaitableObject();
                 if h == winapi::um::handleapi::INVALID_HANDLE_VALUE {
                     None
@@ -1075,6 +1074,7 @@ fn main() {
                         WM_SIZE => {
                             let width = winapi::shared::minwindef::LOWORD(lparam as u32) as i32;
                             let height = winapi::shared::minwindef::HIWORD(lparam as u32) as i32;
+                            state.viewport_dim = float2::new(width as f32, height as f32);
                             main_window.window_dim = (width, height);
                             graphics.update_backbuffer(main_window.hwnd);
                             should_draw = true;
