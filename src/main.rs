@@ -1158,8 +1158,19 @@ fn main() {
 
                 let dim = state.texture.as_ref().unwrap().dim;
 
-                constants.image_dim.x = dim.0 as f32;
-                constants.image_dim.y = dim.1 as f32;
+                let pending_image_dim: float2 = float2::new(dim.0 as f32, dim.1 as f32);
+                if constants.image_dim != pending_image_dim {
+                    constants.image_dim = pending_image_dim;
+                    if !main_window.full_screen {
+                        main_window.set_image_size((dim.0 as i32, dim.1 as i32));
+                    }
+                    state.xfm_window_to_image = Transform2D::new_identity();
+                    let window_dim = float2::new(
+                        main_window.window_dim.0 as f32,
+                        main_window.window_dim.1 as f32,
+                    );
+                    state.xfm_window_to_image.offset = 0.5 * constants.image_dim - 0.5 * window_dim;
+                }
 
                 let image_load_time = Instant::now() - load_begin_time;
                 println!(
@@ -1167,15 +1178,6 @@ fn main() {
                     to_milliseconds(image_load_time),
                     dim
                 );
-                if !main_window.full_screen {
-                    main_window.set_image_size((dim.0 as i32, dim.1 as i32));
-                }
-                state.xfm_window_to_image = Transform2D::new_identity();
-                let window_dim = float2::new(
-                    main_window.window_dim.0 as f32,
-                    main_window.window_dim.1 as f32,
-                );
-                state.xfm_window_to_image.offset = 0.5 * constants.image_dim - 0.5 * window_dim;
             } else {
                 println!("Failed to load image: {:?}", img.err());
             };
