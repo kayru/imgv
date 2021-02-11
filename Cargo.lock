@@ -194,8 +194,9 @@ dependencies = [
 
 [[package]]
 name = "image"
-version = "0.23.12"
-source = "git+https://github.com/kayru/image-rs-fixes.git?branch=allow_tga_a8_as_l8#a59fea12bfad77a2503f83cc2fbe84aaadb02b5d"
+version = "0.23.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "293f07a1875fa7e9c5897b51aa68b2d8ed8271b87e1a44cb64b9c3d98aabbc0d"
 dependencies = [
  "bytemuck",
  "byteorder",
