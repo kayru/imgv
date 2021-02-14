@@ -335,6 +335,16 @@ impl Window {
         Err(())
     }
 
+    pub fn set_window_name(&mut self, name: &str) {
+        let name = OsStr::new(name)
+            .encode_wide()
+            .chain(Some(0).into_iter())
+            .collect::<Vec<u16>>();
+        unsafe {
+            SetWindowTextW(self.hwnd, name.as_ptr());
+        }
+    }
+
     pub fn set_image_size(&mut self, dim: (i32, i32)) {
         if self.full_screen {
             self.set_full_screen(false);
@@ -888,8 +898,8 @@ fn main() {
             profiling::scope!("LoadImage");
             let load_begin_time = Instant::now();
             println!("Loading image {:?}", x);
-            let img = image::open(x);
-            let _ = image_tx.send((img, load_begin_time));
+            let img = image::open(&x);
+            let _ = image_tx.send((img, load_begin_time, x));
             unsafe {
                 InvalidateRect(main_window_handle as HWND, null_mut(), 1);
             }
@@ -1095,7 +1105,8 @@ fn main() {
                                 (new_window_rect.top - main_window.window_rect.top) as f32,
                             );
                             if edge_delta != FLOAT2_ZERO {
-                                state.xfm_window_to_image.offset += edge_delta.mul_element_wise(state.xfm_window_to_image.scale);
+                                state.xfm_window_to_image.offset +=
+                                    edge_delta.mul_element_wise(state.xfm_window_to_image.scale);
                             }
                             main_window.window_rect = new_window_rect;
                             graphics.update_backbuffer(main_window.hwnd);
@@ -1152,8 +1163,9 @@ fn main() {
             .concatenate(xfm_viewport_to_image_uv)
             .into();
 
-        if let Ok((img, load_begin_time)) = image_rx.try_recv() {
+        if let Ok((img, load_begin_time, image_filename)) = image_rx.try_recv() {
             if let Ok(img) = img {
+                // Image loaded
                 state.texture = Some(Texture::new(&graphics.device, img));
 
                 let dim = state.texture.as_ref().unwrap().dim;
@@ -1171,6 +1183,8 @@ fn main() {
                     );
                     state.xfm_window_to_image.offset = 0.5 * constants.image_dim - 0.5 * window_dim;
                 }
+
+                main_window.set_window_name(&image_filename.to_string_lossy());
 
                 let image_load_time = Instant::now() - load_begin_time;
                 println!(
