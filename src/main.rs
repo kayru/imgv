@@ -18,7 +18,7 @@ use winapi::shared::dxgiformat::*;
 use winapi::shared::dxgitype::*;
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::ntdef::{HRESULT, LPCWSTR};
-use winapi::shared::windef::{HBRUSH, HICON, HMENU, HWND, RECT};
+use winapi::shared::windef::{HBRUSH, HICON, HMENU, HWND, RECT, POINT};
 use winapi::shared::windowsx::{GET_X_LPARAM, GET_Y_LPARAM};
 use winapi::shared::winerror::S_OK;
 use winapi::um::d3d11::*;
@@ -380,7 +380,16 @@ impl Window {
             let desktop_rect = get_desktop_work_area().dim();
             AdjustWindowRect(&mut rect, self.window_style, 0);
             if dim.0 < desktop_rect.0 && dim.1 < desktop_rect.1 {
-                ShowWindow(self.hwnd, SW_RESTORE);
+                let placement = WINDOWPLACEMENT {
+                    length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                    flags: 0,
+                    showCmd: SW_RESTORE as u32,
+                    ptMinPosition: POINT{x: 0, y: 0},
+                    ptMaxPosition: POINT{x: 0, y: 0},
+                    rcNormalPosition: RECT{left: 0, top: 0, right: 0, bottom: 0},
+                };
+                //ShowWindow(self.hwnd, SW_RESTORE);
+                SetWindowPlacement(self.hwnd, &placement);
                 SetWindowPos(
                     self.hwnd,
                     null_mut(),
@@ -393,7 +402,16 @@ impl Window {
                 self.window_dim = dim;
                 self.window_rect = get_window_rect_absolute(self.hwnd);
             } else {
-                ShowWindow(self.hwnd, SW_MAXIMIZE);
+                //ShowWindow(self.hwnd, SW_MAXIMIZE);
+                let placement = WINDOWPLACEMENT {
+                    length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                    flags: 0,
+                    showCmd: SW_MAXIMIZE as u32,
+                    ptMinPosition: POINT{x: 0, y: 0},
+                    ptMaxPosition: POINT{x: 0, y: 0},
+                    rcNormalPosition: RECT{left: 0, top: 0, right: 0, bottom: 0},
+                };
+                SetWindowPlacement(self.hwnd, &placement);
             }
         }
     }
