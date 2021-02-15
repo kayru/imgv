@@ -45,6 +45,16 @@ const DXGI_MWA_NO_WINDOW_CHANGES: UINT = 1;
 const DXGI_MWA_NO_ALT_ENTER: UINT = 2;
 const DXGI_MWA_NO_PRINT_SCREEN: UINT = 4;
 
+trait Dimensions {
+    fn dim(&self) -> (i32, i32);
+}
+
+impl Dimensions for RECT {
+    fn dim(&self) -> (i32, i32) {
+        (self.right - self.left, self.bottom - self.top)
+    }
+}
+
 // TODO: can we generate this based on shader reflection or inject into shader code from rust?
 #[repr(C)]
 #[derive(Clone)]
@@ -157,6 +167,20 @@ fn compute_client_rect(dim: (i32, i32)) -> RECT {
     }
 }
 
+fn get_desktop_work_area() -> RECT {
+    let dim = unsafe {
+        let ix = GetSystemMetrics(SM_CXMAXIMIZED);
+        let iy = GetSystemMetrics(SM_CYMAXIMIZED);
+        (ix, iy)
+    };
+    RECT {
+        left: 0,
+        top: 0,
+        right: dim.0,
+        bottom: dim.1,
+    }
+}
+
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     msg: UINT,
@@ -240,6 +264,13 @@ unsafe extern "system" fn window_proc(
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
+fn to_wide_string(s: &str) -> Vec<u16> {
+    OsStr::new(s)
+        .encode_wide()
+        .chain(Some(0).into_iter())
+        .collect::<Vec<u16>>()
+}
+
 impl Window {
     fn new(window_dim: (i32, i32)) -> Result<Window, ()> {
         let (channel_sender, channel_receiver) = std::sync::mpsc::channel();
@@ -258,10 +289,9 @@ impl Window {
                 unsafe {
                     SetProcessDpiAwareness(1);
 
-                    let window_name: Vec<u16> = OsStr::new("imgv\0").encode_wide().collect();
-                    let icon_name: Vec<u16> = OsStr::new("imgv\0").encode_wide().collect();
-                    let window_class_name: Vec<u16> =
-                        OsStr::new("imgv_window_class\0").encode_wide().collect();
+                    let window_name = to_wide_string("imgv");
+                    let icon_name = to_wide_string("imgv");
+                    let window_class_name = to_wide_string("imgv_window_class");
 
                     let hinst = winapi::um::libloaderapi::GetModuleHandleW(null_mut());
                     let hicon: HICON = LoadIconW(hinst, icon_name.as_ptr());
@@ -336,12 +366,8 @@ impl Window {
     }
 
     pub fn set_window_name(&mut self, name: &str) {
-        let name = OsStr::new(name)
-            .encode_wide()
-            .chain(Some(0).into_iter())
-            .collect::<Vec<u16>>();
         unsafe {
-            SetWindowTextW(self.hwnd, name.as_ptr());
+            SetWindowTextW(self.hwnd, to_wide_string(name).as_ptr());
         }
     }
 
@@ -351,18 +377,24 @@ impl Window {
         }
         let mut rect = compute_client_rect(dim);
         unsafe {
+            let desktop_rect = get_desktop_work_area().dim();
             AdjustWindowRect(&mut rect, self.window_style, 0);
-            SetWindowPos(
-                self.hwnd,
-                null_mut(),
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                0,
-            );
-            self.window_dim = dim;
-            self.window_rect = get_window_rect_absolute(self.hwnd);
+            if dim.0 < desktop_rect.0 && dim.1 < desktop_rect.1 {
+                ShowWindow(self.hwnd, SW_RESTORE);
+                SetWindowPos(
+                    self.hwnd,
+                    null_mut(),
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    0,
+                );
+                self.window_dim = dim;
+                self.window_rect = get_window_rect_absolute(self.hwnd);
+            } else {
+                ShowWindow(self.hwnd, SW_MAXIMIZE);
+            }
         }
     }
 
