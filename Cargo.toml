@@ -9,7 +9,7 @@ opt-level = 3
 debug = true
 
 [dependencies]
-winapi = { version = "0.3.9", features = [
+winapi = { version = "0.3", features = [
     "combaseapi",
     "d3d11", 
     "d3d11sdklayers", 
@@ -31,6 +31,7 @@ image = "0.23"
 cgmath = { version="0.18", features = []}
 com_ptr = "0.2.0"
 profiling = { version = "1.0", features = ["profile-with-superluminal"] }
+clipboard-win = "4.2.1"
 
 [build-dependencies]
 winres = "0.1"

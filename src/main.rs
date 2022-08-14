@@ -18,13 +18,14 @@ use winapi::shared::dxgiformat::*;
 use winapi::shared::dxgitype::*;
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::ntdef::{HRESULT, LPCWSTR};
-use winapi::shared::windef::{HBRUSH, HICON, HMENU, HWND, RECT, POINT};
+use winapi::shared::windef::{HBITMAP, HBRUSH, HICON, HMENU, HWND, POINT, RECT};
 use winapi::shared::windowsx::{GET_X_LPARAM, GET_Y_LPARAM};
 use winapi::shared::winerror::S_OK;
 use winapi::um::d3d11::*;
 use winapi::um::d3d11sdklayers::*;
 use winapi::um::d3dcommon::*;
 use winapi::um::shellscalingapi::SetProcessDpiAwareness;
+use winapi::um::winbase::{GlobalAlloc, GlobalFree, GlobalLock, GlobalUnlock, GHND};
 use winapi::um::winuser::*;
 use winapi::Interface;
 
@@ -302,6 +303,7 @@ impl Window {
 
                     AdjustWindowRect(&mut client_rect, window_style, 0);
 
+                    let window_user_data = &mut window_state as *mut WindowThreadState as _;
                     let hwnd = CreateWindowExW(
                         0,
                         window_class_name.as_ptr(),
@@ -314,7 +316,7 @@ impl Window {
                         0 as HWND,
                         0 as HMENU,
                         hinst,
-                        &mut window_state as *mut WindowThreadState as _,
+                        window_user_data,
                     );
                     assert!(hwnd != (0 as HWND), "failed to open the window");
 
@@ -368,9 +370,14 @@ impl Window {
                     length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
                     flags: 0,
                     showCmd: SW_RESTORE as u32,
-                    ptMinPosition: POINT{x: 0, y: 0},
-                    ptMaxPosition: POINT{x: 0, y: 0},
-                    rcNormalPosition: RECT{left: 0, top: 0, right: 0, bottom: 0},
+                    ptMinPosition: POINT { x: 0, y: 0 },
+                    ptMaxPosition: POINT { x: 0, y: 0 },
+                    rcNormalPosition: RECT {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    },
                 };
                 //ShowWindow(self.hwnd, SW_RESTORE);
                 SetWindowPlacement(self.hwnd, &placement);
@@ -391,9 +398,14 @@ impl Window {
                     length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
                     flags: 0,
                     showCmd: SW_MAXIMIZE as u32,
-                    ptMinPosition: POINT{x: 0, y: 0},
-                    ptMaxPosition: POINT{x: 0, y: 0},
-                    rcNormalPosition: RECT{left: 0, top: 0, right: 0, bottom: 0},
+                    ptMinPosition: POINT { x: 0, y: 0 },
+                    ptMaxPosition: POINT { x: 0, y: 0 },
+                    rcNormalPosition: RECT {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    },
                 };
                 SetWindowPlacement(self.hwnd, &placement);
             }
@@ -433,6 +445,88 @@ impl Window {
                 self.window_dim = (w, h);
             }
             self.full_screen = false;
+        }
+    }
+
+    pub fn screenshot(&self) {
+        use winapi::um::wingdi::*;
+
+        println!("capturing screenshot");
+
+        let hdc_screen = unsafe { GetDC(null_mut()) };
+        let hdc_window = unsafe { GetDC(self.hwnd) };
+        let hdc_mem = unsafe { CreateCompatibleDC(hdc_window) };
+        let client_rect = get_client_rect(self.hwnd);
+        let client_rect_dim = client_rect.dim();
+        let hbm_window =
+            unsafe { CreateCompatibleBitmap(hdc_window, client_rect_dim.0, client_rect_dim.1) };
+        let bitmap_info_header = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: client_rect_dim.0,
+            biHeight: client_rect_dim.1,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            biSizeImage: 0,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        };
+
+        let width = bitmap_info_header.biWidth;
+        let height = bitmap_info_header.biHeight;
+
+        let screen_dim = get_screen_dimensions();
+
+        unsafe {
+            SelectObject(hdc_mem, hbm_window as _);
+            BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, 0, 0, SRCCOPY);
+        }
+
+        let bmi_color_dummy = unsafe { std::mem::zeroed() };
+        let mut bitmap_info = BITMAPINFO {
+            bmiHeader: bitmap_info_header,
+            bmiColors: [bmi_color_dummy],
+        };
+
+        let bitmap_size_bytes = (width * height * 4) as usize;
+        let bitmap_memory_handle = unsafe { GlobalAlloc(GHND, bitmap_size_bytes) };
+        let bitmap_memory = unsafe { GlobalLock(bitmap_memory_handle) } as *mut u8;
+
+        let got_scanlines = unsafe {
+            GetDIBits(
+                hdc_screen,
+                hbm_window,
+                0,
+                height as u32,
+                bitmap_memory as _,
+                &mut bitmap_info,
+                DIB_RGB_COLORS,
+            )
+        };
+        assert!(got_scanlines != 0);
+
+        let mut image = image::RgbaImage::new(width as u32, height as u32);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            let i = (x + y * (width as u32) * 4) as usize;
+            let r = unsafe { *bitmap_memory.add(i + 0) };
+            let g = unsafe { *bitmap_memory.add(i + 1) };
+            let b = unsafe { *bitmap_memory.add(i + 2) };
+            *pixel = image::Rgba([r, g, b, 255]);
+        }
+
+        image
+            .save("C:\\Temp\\screenshot.png")
+            .expect("Failed to save screenshot image to file");
+
+        unsafe {
+            DeleteObject(hbm_window as _);
+            DeleteObject(hdc_mem as _);
+            ReleaseDC(self.hwnd, hdc_screen);
+            ReleaseDC(self.hwnd, hdc_window);
+            GlobalUnlock(bitmap_memory_handle);
+            GlobalFree(bitmap_memory_handle);
         }
     }
 }
@@ -714,6 +808,10 @@ fn main() {
                             should_draw = true;
                         }
                         WM_KEYDOWN => {
+                            let ctrl_down = unsafe {
+                                (GetKeyState(VK_LCONTROL) < 0) || (GetKeyState(VK_RCONTROL) < 0)
+                            };
+
                             match (wparam as i32, wparam as u8 as char) {
                                 (VK_ESCAPE, _) => {
                                     should_exit = true;
@@ -761,6 +859,9 @@ fn main() {
                                 (_, '5') => {
                                     let s = 1.0 / 16.0;
                                     state.xfm_window_to_image.scale = float2::new(s, s);
+                                }
+                                (_, 'C') | (VK_INSERT, _) if ctrl_down => {
+                                    main_window.screenshot();
                                 }
                                 _ => {}
                             }
