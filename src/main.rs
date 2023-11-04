@@ -18,21 +18,27 @@ use winapi::shared::dxgiformat::*;
 use winapi::shared::dxgitype::*;
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::ntdef::{HRESULT, LPCWSTR};
-use winapi::shared::windef::{HBRUSH, HICON, HMENU, HWND, RECT, POINT};
+use winapi::shared::windef::{HBITMAP, HBRUSH, HICON, HMENU, HWND, POINT, RECT};
 use winapi::shared::windowsx::{GET_X_LPARAM, GET_Y_LPARAM};
 use winapi::shared::winerror::S_OK;
 use winapi::um::d3d11::*;
 use winapi::um::d3d11sdklayers::*;
 use winapi::um::d3dcommon::*;
 use winapi::um::shellscalingapi::SetProcessDpiAwareness;
+use winapi::um::winbase::{GlobalAlloc, GlobalFree, GlobalLock, GlobalUnlock, GHND};
 use winapi::um::winuser::*;
 use winapi::Interface;
+
+use display_info::DisplayInfo;
 
 mod math;
 use math::*;
 
 mod graphics;
 use graphics::*;
+
+mod capture;
+use capture::*;
 
 const VERBOSE_LOG: bool = false;
 
@@ -302,6 +308,7 @@ impl Window {
 
                     AdjustWindowRect(&mut client_rect, window_style, 0);
 
+                    let window_user_data = &mut window_state as *mut WindowThreadState as _;
                     let hwnd = CreateWindowExW(
                         0,
                         window_class_name.as_ptr(),
@@ -314,7 +321,7 @@ impl Window {
                         0 as HWND,
                         0 as HMENU,
                         hinst,
-                        &mut window_state as *mut WindowThreadState as _,
+                        window_user_data,
                     );
                     assert!(hwnd != (0 as HWND), "failed to open the window");
 
@@ -368,9 +375,14 @@ impl Window {
                     length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
                     flags: 0,
                     showCmd: SW_RESTORE as u32,
-                    ptMinPosition: POINT{x: 0, y: 0},
-                    ptMaxPosition: POINT{x: 0, y: 0},
-                    rcNormalPosition: RECT{left: 0, top: 0, right: 0, bottom: 0},
+                    ptMinPosition: POINT { x: 0, y: 0 },
+                    ptMaxPosition: POINT { x: 0, y: 0 },
+                    rcNormalPosition: RECT {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    },
                 };
                 //ShowWindow(self.hwnd, SW_RESTORE);
                 SetWindowPlacement(self.hwnd, &placement);
@@ -391,9 +403,14 @@ impl Window {
                     length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
                     flags: 0,
                     showCmd: SW_MAXIMIZE as u32,
-                    ptMinPosition: POINT{x: 0, y: 0},
-                    ptMaxPosition: POINT{x: 0, y: 0},
-                    rcNormalPosition: RECT{left: 0, top: 0, right: 0, bottom: 0},
+                    ptMinPosition: POINT { x: 0, y: 0 },
+                    ptMaxPosition: POINT { x: 0, y: 0 },
+                    rcNormalPosition: RECT {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    },
                 };
                 SetWindowPlacement(self.hwnd, &placement);
             }
@@ -434,6 +451,14 @@ impl Window {
             }
             self.full_screen = false;
         }
+    }
+
+    pub fn screenshot(&self) {
+        let image = capture_window(self.hwnd as isize).expect("Failed to capture window image");
+
+        image
+            .save("C:\\Temp\\screenshot.png")
+            .expect("Failed to save screenshot image to file");
     }
 }
 
@@ -714,6 +739,10 @@ fn main() {
                             should_draw = true;
                         }
                         WM_KEYDOWN => {
+                            let ctrl_down = unsafe {
+                                (GetKeyState(VK_LCONTROL) < 0) || (GetKeyState(VK_RCONTROL) < 0)
+                            };
+
                             match (wparam as i32, wparam as u8 as char) {
                                 (VK_ESCAPE, _) => {
                                     should_exit = true;
@@ -761,6 +790,9 @@ fn main() {
                                 (_, '5') => {
                                     let s = 1.0 / 16.0;
                                     state.xfm_window_to_image.scale = float2::new(s, s);
+                                }
+                                (_, 'C') | (VK_INSERT, _) if ctrl_down => {
+                                    main_window.screenshot();
                                 }
                                 _ => {}
                             }

@@ -9,7 +9,7 @@ opt-level = 3
 debug = true
 
 [dependencies]
-winapi = { version = "0.3.9", features = [
+winapi = { version = "0.3", features = [
     "combaseapi",
     "d3d11", 
     "d3d11sdklayers", 
@@ -27,10 +27,22 @@ winapi = { version = "0.3.9", features = [
     "winuser",
     ]}
 
-image = "0.23"
+fxhash = "0.2"
+anyhow = "1.0"
+display-info = "0.4"
+image = "0.24"
 cgmath = { version="0.18", features = []}
 com_ptr = "0.2.0"
 profiling = { version = "1.0", features = ["profile-with-superluminal"] }
+clipboard-win = "4.2.1"
+widestring = "1.0"
+
+[dependencies.windows]
+version = "0.51"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+]
 
 [build-dependencies]
 winres = "0.1"

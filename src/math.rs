@@ -40,7 +40,10 @@ impl Box2D {
 
 impl Default for Box2D {
     fn default() -> Self {
-        Box2D { min: FLOAT2_ZERO, max: FLOAT2_ZERO }
+        Box2D {
+            min: FLOAT2_ZERO,
+            max: FLOAT2_ZERO,
+        }
     }
 }
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -184,4 +187,3 @@ fn test_transform() {
         assert_ulps_eq!(b2.max, float2::new(5.0, 6.0));
     }
 }
-

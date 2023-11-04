@@ -1,4 +1,3 @@
-
 use cgmath::{assert_ulps_eq, prelude::*};
 use com_ptr::{hresult, ComPtr};
 use std::ffi::OsString;
@@ -15,7 +14,7 @@ use winapi::shared::dxgiformat::*;
 use winapi::shared::dxgitype::*;
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::ntdef::{HRESULT, LPCWSTR};
-use winapi::shared::windef::{HBRUSH, HICON, HMENU, HWND, RECT, POINT};
+use winapi::shared::windef::{HBRUSH, HICON, HMENU, HWND, POINT, RECT};
 use winapi::shared::windowsx::{GET_X_LPARAM, GET_Y_LPARAM};
 use winapi::shared::winerror::S_OK;
 use winapi::um::d3d11::*;
@@ -25,8 +24,8 @@ use winapi::um::shellscalingapi::SetProcessDpiAwareness;
 use winapi::um::winuser::*;
 use winapi::Interface;
 
-use crate::math::*;
 use crate::get_window_client_rect_dimensions;
+use crate::math::*;
 
 const NUM_BACK_BUFFERS: u32 = 3;
 const BACK_BUFFER_FORMAT: u32 = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -356,7 +355,6 @@ impl GraphicsD3D11 {
         }
     }
 }
-
 
 pub struct Texture {
     pub tex: ComPtr<ID3D11Texture2D>,
