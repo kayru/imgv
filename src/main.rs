@@ -460,6 +460,10 @@ impl Window {
             .save("C:\\Temp\\screenshot.png")
             .expect("Failed to save screenshot image to file");
     }
+
+    pub fn clipboard_save(&self) {
+        save_to_clipboard(self.hwnd as isize).expect("Failed to capture image to clipboard");
+    }
 }
 
 fn process_window_messages(window: &Window, should_block: bool) -> Option<WindowMessages> {
@@ -792,7 +796,7 @@ fn main() {
                                     state.xfm_window_to_image.scale = float2::new(s, s);
                                 }
                                 (_, 'C') | (VK_INSERT, _) if ctrl_down => {
-                                    main_window.screenshot();
+                                    main_window.clipboard_save();
                                 }
                                 _ => {}
                             }
