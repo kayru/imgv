@@ -2,9 +2,9 @@ use crate::get_client_rect_absolute;
 use anyhow::{anyhow, Result};
 use display_info::DisplayInfo;
 use image::GenericImageView;
-use widestring::U16CString;
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
+use std::time::Duration;
+use windows::core::{BOOL, PCWSTR};
+use windows::Win32::Foundation::{FALSE, HWND, LPARAM, POINT, RECT, TRUE};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleBitmap, CreateCompatibleDC, CreateDCW, DeleteDC, DeleteObject,
     EnumDisplayMonitors, GetDIBits, GetMonitorInfoW, GetObjectW, MapWindowPoints, SelectObject,
@@ -26,7 +26,7 @@ macro_rules! scoped_drop {
 
         impl Drop for ScopedDrop {
             fn drop(&mut self) {
-                $drop(self.0);
+                let _ = $drop(self.0);
             }
         }
 
@@ -51,24 +51,25 @@ extern "system" fn monitor_enum_proc(
     _: *mut RECT,
     state: LPARAM,
 ) -> BOOL {
-    let box_monitor_info_exw = unsafe { Box::from_raw(state.0 as *mut Vec<MONITORINFOEXW>) };
+    let box_monitor_info_exw =
+        unsafe { Box::from_raw(state.0 as *mut Vec<(HMONITOR, MONITORINFOEXW)>) };
     let state = Box::leak(box_monitor_info_exw);
 
     match get_monitor_info(h_monitor) {
         Ok(monitor_info_exw) => {
-            state.push(monitor_info_exw);
-            BOOL::from(true)
+            state.push((h_monitor, monitor_info_exw));
+            TRUE
         }
-        Err(_) => BOOL::from(false),
+        Err(_) => FALSE,
     }
 }
 
 fn get_monitor_info_by_id(id: u32) -> Result<MONITORINFOEXW> {
-    let monitor_info: *mut Vec<MONITORINFOEXW> = Box::into_raw(Box::default());
+    let monitor_info: *mut Vec<(HMONITOR, MONITORINFOEXW)> = Box::into_raw(Box::default());
 
     unsafe {
         EnumDisplayMonitors(
-            HDC::default(),
+            None,
             None,
             Some(monitor_enum_proc),
             LPARAM(monitor_info as isize),
@@ -80,15 +81,10 @@ fn get_monitor_info_by_id(id: u32) -> Result<MONITORINFOEXW> {
 
     let monitor_info_res = monitor_info_borrow
         .iter()
-        .find(|&&monitor_info| {
-            let sz_device_ptr = monitor_info.szDevice.as_ptr();
-            let sz_device_string =
-                unsafe { U16CString::from_ptr_str(sz_device_ptr).to_string_lossy() };
-            fxhash::hash32(sz_device_string.as_bytes()) == id
-        })
+        .find(|(h_monitor, _)| h_monitor.0 as u32 == id)
         .ok_or_else(|| anyhow!("Can't find a display by id {id}"))?;
 
-    Ok(*monitor_info_res)
+    Ok(monitor_info_res.1)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -150,7 +146,11 @@ fn calc_capture_area(
 pub fn capture_window(hwnd: isize) -> Result<image::RgbaImage> {
     let mut mapped_point: [POINT; 1] = [POINT::default()];
     unsafe {
-        MapWindowPoints(HWND(hwnd), HWND(0), &mut mapped_point);
+        MapWindowPoints(
+            Some(HWND(hwnd as *mut _)),
+            None,
+            &mut mapped_point,
+        );
     }
 
     let region_x = mapped_point[0].x;
@@ -194,18 +194,18 @@ pub fn capture_window(hwnd: isize) -> Result<image::RgbaImage> {
 
     let scoped_compat_dc = scoped_drop!(
         HDC,
-        unsafe { CreateCompatibleDC(*scoped_dcw) },
+        unsafe { CreateCompatibleDC(Some(*scoped_dcw)) },
         |compatible_dc| unsafe { DeleteDC(compatible_dc) }
     );
 
     let scoped_compat_bm = scoped_drop!(
         HBITMAP,
         unsafe { CreateCompatibleBitmap(*scoped_dcw, w, h) },
-        |h_bitmap| unsafe { DeleteObject(h_bitmap) }
+        |h_bitmap: HBITMAP| unsafe { DeleteObject(h_bitmap.into()) }
     );
 
     unsafe {
-        SelectObject(*scoped_compat_dc, *scoped_compat_bm);
+        SelectObject(*scoped_compat_dc, (*scoped_compat_bm).into());
         SetStretchBltMode(*scoped_dcw, STRETCH_HALFTONE);
     };
 
@@ -216,7 +216,7 @@ pub fn capture_window(hwnd: isize) -> Result<image::RgbaImage> {
             0,
             w,
             h,
-            *scoped_dcw,
+            Some(*scoped_dcw),
             x,
             y,
             w,
@@ -267,7 +267,7 @@ pub fn capture_window(hwnd: isize) -> Result<image::RgbaImage> {
 
     unsafe {
         GetObjectW(
-            *scoped_compat_bm,
+            (*scoped_compat_bm).into(),
             std::mem::size_of::<BITMAP>() as i32,
             Some(bitmap_ptr),
         );
@@ -288,6 +288,32 @@ pub fn capture_window(hwnd: isize) -> Result<image::RgbaImage> {
         .ok_or(anyhow!("Image buffer is not large enough"))
 }
 
+fn write_bitmap_to_clipboard(hwnd: isize, bmp_data: &[u8]) -> Result<()> {
+    const BMP_FILE_HEADER_SIZE: usize = 14;
+    let mut attempts = 50;
+    loop {
+        match clipboard_win::Clipboard::new_for(hwnd as *mut _) {
+            Ok(_clip) => {
+                clipboard_win::raw::empty()
+                    .map_err(|err| anyhow!("Failed to clear clipboard: {err:?}"))?;
+                clipboard_win::raw::set_bitmap(bmp_data)
+                    .map_err(|err| anyhow!("Failed to set CF_BITMAP: {err:?}"))?;
+                let dib_data = &bmp_data[BMP_FILE_HEADER_SIZE..];
+                clipboard_win::raw::set_without_clear(clipboard_win::formats::CF_DIB, dib_data)
+                    .map_err(|err| anyhow!("Failed to set CF_DIB: {err:?}"))?;
+                return Ok(());
+            }
+            Err(err) => {
+                if attempts == 0 {
+                    return Err(anyhow!("Failed to open clipboard: {err:?}"));
+                }
+                attempts -= 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
 pub fn save_to_clipboard(hwnd: isize) -> Result<()> {
     let image = capture_window(hwnd).expect("Failed to capture window image");
 
@@ -304,7 +330,7 @@ pub fn save_to_clipboard(hwnd: isize) -> Result<()> {
         byte_vec.push(pixel_bytes[3]);
     }
 
-    clipboard_win::set_clipboard(clipboard_win::formats::Bitmap, byte_vec)
+    write_bitmap_to_clipboard(hwnd, &byte_vec)
         .expect("Failed to save image to clipboard");
     Ok(())
 }
