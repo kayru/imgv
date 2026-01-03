@@ -336,9 +336,16 @@ impl Window {
                             break;
                         }
                         let mut msg: MSG = std::mem::zeroed();
-                        if GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+                        let result = GetMessageW(&mut msg, null_mut(), 0, 0);
+                        if result > 0 {
                             TranslateMessage(&msg);
                             DispatchMessageW(&msg);
+                        } else if result == 0 {
+                            break;
+                        } else {
+                            let _ = window_state.message_tx.send(WindowMessages::WindowClosed);
+                            window_state.is_window_closed = true;
+                            break;
                         }
                     }
                 }
