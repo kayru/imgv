@@ -112,8 +112,8 @@ fn calc_capture_area(
     let mut x1 = x + display_info.x;
     let mut y1 = y + display_info.y;
 
-    let mut x2 = x1 + w as i32;
-    let mut y2 = y1 + h as i32;
+    let mut x2 = x1 + w;
+    let mut y2 = y1 + h;
 
     if x1 < display_info.x {
         x1 = display_info.x;
@@ -292,7 +292,7 @@ pub fn save_to_clipboard(hwnd: isize) -> Result<()> {
     let image = capture_window(hwnd).expect("Failed to capture window image");
 
     let dyn_image: image::DynamicImage = image.into();
-    dyn_image.flipv();
+    let dyn_image = dyn_image.flipv();
 
     let mut byte_vec = create_bmp_header(dyn_image.width(), dyn_image.height());
     for (_, _, pixel) in dyn_image.pixels() {

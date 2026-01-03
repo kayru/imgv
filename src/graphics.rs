@@ -239,13 +239,13 @@ impl GraphicsD3D11 {
             };
 
             {
-                let smp_desc = smp_desc_base.clone();
+                let smp_desc = smp_desc_base;
                 let hr = device.CreateSamplerState(&smp_desc, &mut smp_linear);
                 assert!(hr == S_OK);
             }
 
             {
-                let mut smp_desc = smp_desc_base.clone();
+                let mut smp_desc = smp_desc_base;
                 smp_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
                 let hr = device.CreateSamplerState(&smp_desc, &mut smp_point);
                 assert!(hr == S_OK);

@@ -29,10 +29,10 @@ fn main() {
         println!("-- compiling {}", shader.entry);
         let dest_path = Path::new(&out_dir).join(shader.entry.to_owned() + ".dxbc");
         let fxc_status = Command::new(&fxc_path)
-            .args(&[
+            .args([
                 "/nologo",
                 "/T",
-                &shader.target,
+                shader.target,
                 "/Fo",
                 &dest_path.to_string_lossy(),
                 "/E",
@@ -55,13 +55,7 @@ fn main() {
 }
 
 fn saturate(x: f32) -> f32 {
-    if x < 0.0 {
-        0.0
-    } else if x > 1.0 {
-        1.0
-    } else {
-        x
-    }
+    x.clamp(0.0, 1.0)
 }
 
 fn quantize_u8(x: f32) -> u8 {
@@ -85,13 +79,13 @@ fn make_icon() -> std::path::PathBuf {
     let out_dir = env::var_os("OUT_DIR").unwrap();
     let w = 16i32;
     let h = 16i32;
-    let mut pixels = vec![std::u8::MAX; (4 * w * h) as usize];
+    let mut pixels = vec![u8::MAX; (4 * w * h) as usize];
     for y in 0..h {
         for x in 0..w {
             let i = (x + y * w) as usize;
             let uv = (x as f32 / w as f32, y as f32 / h as f32);
             let c = get_icon_color(uv);
-            pixels[i * 4 + 0] = c.0;
+            pixels[i * 4] = c.0;
             pixels[i * 4 + 1] = c.1;
             pixels[i * 4 + 2] = c.2;
             pixels[i * 4 + 3] = c.3;

@@ -139,11 +139,10 @@ fn get_client_rect(hwnd: HWND) -> RECT {
 
 fn get_window_client_rect_dimensions(hwnd: HWND) -> (i32, i32) {
     let client_rect = get_client_rect(hwnd);
-    let dimensions = (
-        (client_rect.right - client_rect.left),
-        (client_rect.bottom - client_rect.top),
-    );
-    dimensions
+    (
+        client_rect.right - client_rect.left,
+        client_rect.bottom - client_rect.top,
+    )
 }
 
 fn compute_client_rect(dim: (i32, i32)) -> RECT {
@@ -219,15 +218,14 @@ unsafe extern "system" fn window_proc(
                 let hdrop = wparam as HDROP;
                 let filename_len = DragQueryFileW(hdrop, 0, null_mut(), 0) as usize;
                 if filename_len > 0 {
-                    let mut filename_bytes = Vec::<u16>::with_capacity(filename_len + 1);
-                    filename_bytes.set_len(filename_len + 1);
+                    let mut filename_bytes = vec![0u16; filename_len + 1];
                     DragQueryFileW(
                         hdrop,
                         0,
                         filename_bytes.as_mut_ptr(),
                         filename_bytes.len() as u32,
                     );
-                    filename_bytes.set_len(filename_bytes.len() - 1);
+                    filename_bytes.pop();
                     let filename = OsString::from_wide(&filename_bytes);
                     window_state
                         .message_tx
@@ -257,7 +255,7 @@ unsafe extern "system" fn window_proc(
 fn to_wide_string(s: &str) -> Vec<u16> {
     OsStr::new(s)
         .encode_wide()
-        .chain(Some(0).into_iter())
+        .chain(std::iter::once(0))
         .collect::<Vec<u16>>()
 }
 
@@ -330,7 +328,10 @@ impl Window {
                     // Delay showing this window until D3D is ready to draw something
                     // ShowWindow(hwnd, SW_SHOW);
 
-                    while !window_state.is_window_closed {
+                    loop {
+                        if window_state.is_window_closed {
+                            break;
+                        }
                         let mut msg: MSG = std::mem::zeroed();
                         if GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
                             TranslateMessage(&msg);
@@ -473,10 +474,8 @@ fn process_window_messages(window: &Window, should_block: bool) -> Option<Window
         if let Ok(x) = window.message_rx.recv() {
             return Some(x);
         }
-    } else {
-        if let Ok(x) = window.message_rx.try_recv() {
-            return Some(x);
-        }
+    } else if let Ok(x) = window.message_rx.try_recv() {
+        return Some(x);
     }
     None
 }
@@ -515,13 +514,7 @@ fn get_next_file(path: &Path, direction: StepDirection) -> Option<PathBuf> {
     let dir = std::fs::read_dir(file_dir);
     if let Ok(dir) = dir {
         let files: Vec<_> = dir
-            .filter_map(|f| {
-                if f.is_ok() {
-                    Some(f.unwrap().path())
-                } else {
-                    None
-                }
-            })
+            .filter_map(|f| f.ok().map(|f| f.path()))
             .filter(|f| is_compatible_file(f))
             .map(|f| f.file_name().unwrap().to_owned())
             .collect();
@@ -632,9 +625,8 @@ fn main() {
     let switch_to_next_image = |current_image_path: &Path, direction: StepDirection| {
         let file_name = get_next_file(current_image_path, direction);
         let file_dir = current_image_path.parent();
-        if file_name.is_some() && file_dir.is_some() {
-            let file_name = file_name.unwrap();
-            let file_dir = file_dir.unwrap().to_path_buf();
+        if let (Some(file_name), Some(file_dir)) = (file_name, file_dir) {
+            let file_dir = file_dir.to_path_buf();
             let path = file_dir.join(file_name);
             load_req_tx.send(path.clone()).unwrap();
             Some(path)

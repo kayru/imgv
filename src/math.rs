@@ -103,14 +103,14 @@ impl Transform2D {
     pub fn inplace_concatenate(&mut self, other: Self) {
         *self = self.concatenate(other);
     }
-    pub fn to_float4(&self) -> float4 {
+    pub fn to_float4(self) -> float4 {
         float4::new(self.scale.x, self.scale.y, self.offset.x, self.offset.y)
     }
 }
 
-impl Into<float4> for Transform2D {
-    fn into(self) -> float4 {
-        self.to_float4()
+impl From<Transform2D> for float4 {
+    fn from(val: Transform2D) -> Self {
+        val.to_float4()
     }
 }
 
