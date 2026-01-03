@@ -40,6 +40,9 @@ use graphics::*;
 mod capture;
 use capture::*;
 
+mod clipboard;
+use clipboard::*;
+
 const VERBOSE_LOG: bool = false;
 
 const WINDOW_MIN_WIDTH: i32 = 320;
@@ -566,6 +569,39 @@ impl ViewerState {
     }
 }
 
+fn apply_loaded_image(
+    state: &mut ViewerState,
+    main_window: &mut Window,
+    graphics: &GraphicsD3D11,
+    constants: &mut Constants,
+    img: image::DynamicImage,
+    image_name: Option<&str>,
+) -> (u32, u32) {
+    state.texture = Some(Texture::new(&graphics.device, img));
+
+    let dim = state.texture.as_ref().unwrap().dim;
+
+    let pending_image_dim: float2 = float2::new(dim.0 as f32, dim.1 as f32);
+    if constants.image_dim != pending_image_dim {
+        constants.image_dim = pending_image_dim;
+        if !main_window.full_screen {
+            main_window.set_image_size((dim.0 as i32, dim.1 as i32));
+        }
+        state.xfm_window_to_image = Transform2D::new_identity();
+        let window_dim = float2::new(
+            main_window.window_dim.0 as f32,
+            main_window.window_dim.1 as f32,
+        );
+        state.xfm_window_to_image.offset = 0.5 * constants.image_dim - 0.5 * window_dim;
+    }
+
+    if let Some(image_name) = image_name {
+        main_window.set_window_name(image_name);
+    }
+
+    dim
+}
+
 fn main() {
     profiling::register_thread!("main");
 
@@ -787,6 +823,26 @@ fn main() {
                                     let s = 1.0 / 16.0;
                                     state.xfm_window_to_image.scale = float2::new(s, s);
                                 }
+                                (_, 'V') if ctrl_down => {
+                                    if let Ok(Some(path)) = get_clipboard_file_path() {
+                                        image_path = Some(path.clone());
+                                        load_req_tx.send(path).unwrap();
+                                    } else if let Ok(Some(img)) = get_clipboard_image() {
+                                        image_path = None;
+                                        let dim = apply_loaded_image(
+                                            &mut state,
+                                            &mut main_window,
+                                            &graphics,
+                                            &mut constants,
+                                            img,
+                                            Some("Clipboard Image"),
+                                        );
+                                        println!(
+                                            "Loaded clipboard image {:?}x{:?}",
+                                            dim.0, dim.1
+                                        );
+                                    }
+                                }
                                 (_, 'C') | (VK_INSERT, _) if ctrl_down => {
                                     main_window.clipboard_save();
                                 }
@@ -866,25 +922,15 @@ fn main() {
         if let Ok((img, load_begin_time, image_filename)) = image_rx.try_recv() {
             if let Ok(img) = img {
                 // Image loaded
-                state.texture = Some(Texture::new(&graphics.device, img));
-
-                let dim = state.texture.as_ref().unwrap().dim;
-
-                let pending_image_dim: float2 = float2::new(dim.0 as f32, dim.1 as f32);
-                if constants.image_dim != pending_image_dim {
-                    constants.image_dim = pending_image_dim;
-                    if !main_window.full_screen {
-                        main_window.set_image_size((dim.0 as i32, dim.1 as i32));
-                    }
-                    state.xfm_window_to_image = Transform2D::new_identity();
-                    let window_dim = float2::new(
-                        main_window.window_dim.0 as f32,
-                        main_window.window_dim.1 as f32,
-                    );
-                    state.xfm_window_to_image.offset = 0.5 * constants.image_dim - 0.5 * window_dim;
-                }
-
-                main_window.set_window_name(&image_filename.to_string_lossy());
+                let image_name = image_filename.to_string_lossy().into_owned();
+                let dim = apply_loaded_image(
+                    &mut state,
+                    &mut main_window,
+                    &graphics,
+                    &mut constants,
+                    img,
+                    Some(&image_name),
+                );
 
                 let image_load_time = Instant::now() - load_begin_time;
                 println!(

@@ -2,7 +2,7 @@ use crate::get_client_rect_absolute;
 use anyhow::{anyhow, Result};
 use display_info::DisplayInfo;
 use image::GenericImageView;
-use std::time::Duration;
+use crate::clipboard::write_bitmap_to_clipboard;
 use windows::core::{BOOL, PCWSTR};
 use windows::Win32::Foundation::{FALSE, HWND, LPARAM, POINT, RECT, TRUE};
 use windows::Win32::Graphics::Gdi::{
@@ -286,32 +286,6 @@ pub fn capture_window(hwnd: isize) -> Result<image::RgbaImage> {
 
     image::RgbaImage::from_vec(w as u32, h as u32, rgba_buf)
         .ok_or(anyhow!("Image buffer is not large enough"))
-}
-
-fn write_bitmap_to_clipboard(hwnd: isize, bmp_data: &[u8]) -> Result<()> {
-    const BMP_FILE_HEADER_SIZE: usize = 14;
-    let mut attempts = 50;
-    loop {
-        match clipboard_win::Clipboard::new_for(hwnd as *mut _) {
-            Ok(_clip) => {
-                clipboard_win::raw::empty()
-                    .map_err(|err| anyhow!("Failed to clear clipboard: {err:?}"))?;
-                clipboard_win::raw::set_bitmap(bmp_data)
-                    .map_err(|err| anyhow!("Failed to set CF_BITMAP: {err:?}"))?;
-                let dib_data = &bmp_data[BMP_FILE_HEADER_SIZE..];
-                clipboard_win::raw::set_without_clear(clipboard_win::formats::CF_DIB, dib_data)
-                    .map_err(|err| anyhow!("Failed to set CF_DIB: {err:?}"))?;
-                return Ok(());
-            }
-            Err(err) => {
-                if attempts == 0 {
-                    return Err(anyhow!("Failed to open clipboard: {err:?}"));
-                }
-                attempts -= 1;
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-    }
 }
 
 pub fn save_to_clipboard(hwnd: isize) -> Result<()> {
