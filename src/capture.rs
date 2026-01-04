@@ -201,8 +201,8 @@ pub fn capture_window(hwnd: isize) -> Result<image::RgbaImage> {
         bmiColors: [RGBQUAD::default(); 1],
     };
 
-    let data = vec![0u8; (w * h) as usize * 4];
-    let buf_prt = data.as_ptr() as *mut _;
+    let mut data = vec![0u8; (w * h) as usize * 4];
+    let buf_prt = data.as_mut_ptr() as *mut _;
 
     let is_success = unsafe {
         GetDIBits(
