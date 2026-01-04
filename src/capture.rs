@@ -3,11 +3,11 @@ use anyhow::{anyhow, Result};
 use display_info::DisplayInfo;
 use image::GenericImageView;
 use crate::clipboard::write_bitmap_to_clipboard;
-use windows::core::{BOOL, PCWSTR};
-use windows::Win32::Foundation::{FALSE, HWND, LPARAM, POINT, RECT, TRUE};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleBitmap, CreateCompatibleDC, CreateDCW, DeleteDC, DeleteObject,
-    EnumDisplayMonitors, GetDIBits, GetMonitorInfoW, GetObjectW, MapWindowPoints, SelectObject,
+    GetDIBits, GetMonitorInfoW, GetObjectW, MapWindowPoints, SelectObject,
     SetStretchBltMode, StretchBlt, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP,
     HDC, HMONITOR, MONITORINFOEXW, RGBQUAD, SRCCOPY, STRETCH_HALFTONE,
 };
@@ -43,48 +43,6 @@ fn get_monitor_info(h_monitor: HMONITOR) -> Result<MONITORINFOEXW> {
         GetMonitorInfoW(h_monitor, monitor_info_exw_ptr).ok()?;
     };
     Ok(monitor_info_exw)
-}
-
-extern "system" fn monitor_enum_proc(
-    h_monitor: HMONITOR,
-    _: HDC,
-    _: *mut RECT,
-    state: LPARAM,
-) -> BOOL {
-    let box_monitor_info_exw =
-        unsafe { Box::from_raw(state.0 as *mut Vec<(HMONITOR, MONITORINFOEXW)>) };
-    let state = Box::leak(box_monitor_info_exw);
-
-    match get_monitor_info(h_monitor) {
-        Ok(monitor_info_exw) => {
-            state.push((h_monitor, monitor_info_exw));
-            TRUE
-        }
-        Err(_) => FALSE,
-    }
-}
-
-fn get_monitor_info_by_id(id: u32) -> Result<MONITORINFOEXW> {
-    let monitor_info: *mut Vec<(HMONITOR, MONITORINFOEXW)> = Box::into_raw(Box::default());
-
-    unsafe {
-        EnumDisplayMonitors(
-            None,
-            None,
-            Some(monitor_enum_proc),
-            LPARAM(monitor_info as isize),
-        )
-        .ok()?;
-    };
-
-    let monitor_info_borrow = unsafe { &Box::from_raw(monitor_info) };
-
-    let monitor_info_res = monitor_info_borrow
-        .iter()
-        .find(|(h_monitor, _)| h_monitor.0 as u32 == id)
-        .ok_or_else(|| anyhow!("Can't find a display by id {id}"))?;
-
-    Ok(monitor_info_res.1)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -158,7 +116,7 @@ pub fn capture_window(hwnd: isize) -> Result<image::RgbaImage> {
 
     let display_info =
         DisplayInfo::from_point(region_x, region_y).expect("Failed to look up display info");
-    let monitor_info = get_monitor_info_by_id(display_info.id)?;
+    let monitor_info = get_monitor_info(display_info.raw_handle)?;
 
     let client_rect = get_client_rect_absolute(hwnd as *mut _);
 
