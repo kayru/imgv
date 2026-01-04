@@ -827,12 +827,50 @@ fn main() {
                     Some(&image_name),
                 );
 
-                if img.exif.is_some() || img.icc_profile.is_some() || img.orientation.is_some() {
+                if img.exif.is_some()
+                    || img.icc_profile.is_some()
+                    || img.orientation.is_some()
+                    || img.exif_info.is_some()
+                    || img.icc_info.is_some()
+                {
                     info!(
                         "Metadata: exif={} bytes, icc={} bytes, orientation={:?}",
                         img.exif.as_ref().map_or(0, |v| v.len()),
                         img.icc_profile.as_ref().map_or(0, |v| v.len()),
                         img.orientation
+                    );
+                }
+
+                if let Some(exif) = &img.exif_info {
+                    info!(
+                        "EXIF: make={:?}, model={:?}, software={:?}, datetime={:?}, original={:?}, lens={:?}, orientation={:?}",
+                        exif.make,
+                        exif.model,
+                        exif.software,
+                        exif.datetime,
+                        exif.datetime_original,
+                        exif.lens_model,
+                        exif.orientation
+                    );
+                    if let Some(gps) = &exif.gps_iso6709 {
+                        info!("EXIF GPS: {}", gps);
+                    }
+                }
+
+                if let Some(icc) = &img.icc_info {
+                    info!(
+                        "ICC: size={} bytes, class={}, color_space={}, pcs={}, cmm={}, version={}, platform={}, manufacturer={}, model={}, intent={}, created={}",
+                        icc.size,
+                        icc.profile_class,
+                        icc.color_space,
+                        icc.pcs,
+                        icc.cmm_type,
+                        icc.version,
+                        icc.platform,
+                        icc.manufacturer,
+                        icc.model,
+                        icc.rendering_intent,
+                        icc.created.as_deref().unwrap_or("n/a")
                     );
                 }
 

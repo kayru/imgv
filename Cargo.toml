@@ -36,9 +36,11 @@ winapi = { version = "0.3.9", features = [
 anyhow = "1.0.100"
 display-info = "0.5.7"
 env_logger = "0.11.6"
+icc-profile = "0.0.2"
 image = "0.25.9"
 cgmath = { version="0.18", features = []}
 com_ptr = "0.2.1"
+nom-exif = "2.5.4"
 log = "0.4.26"
 profiling = { version = "1.0.17", features = ["profile-with-superluminal"] }
 clipboard-win = "5.4.1"
