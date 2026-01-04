@@ -1,4 +1,4 @@
-use crate::get_client_rect_absolute;
+use crate::window::get_client_rect_absolute;
 use anyhow::{anyhow, Result};
 use display_info::DisplayInfo;
 use image::GenericImageView;

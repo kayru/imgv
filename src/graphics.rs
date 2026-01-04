@@ -1,5 +1,6 @@
 use cgmath::{assert_ulps_eq, prelude::*};
 use com_ptr::{hresult, ComPtr};
+use log::{debug, info};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::prelude::*;
@@ -24,7 +25,7 @@ use winapi::um::shellscalingapi::SetProcessDpiAwareness;
 use winapi::um::winuser::*;
 use winapi::Interface;
 
-use crate::get_window_client_rect_dimensions;
+use crate::window::get_window_client_rect_dimensions;
 use crate::math::*;
 
 const NUM_BACK_BUFFERS: u32 = 3;
@@ -164,7 +165,7 @@ impl GraphicsD3D11 {
                 if h == winapi::um::handleapi::INVALID_HANDLE_VALUE {
                     None
                 } else {
-                    println!("IDXGISwapChain2 waitable object available");
+                    info!("IDXGISwapChain2 waitable object available");
                     Some(h)
                 }
             } else {
@@ -179,7 +180,7 @@ impl GraphicsD3D11 {
                 &mut info_queue as *mut *mut ID3D11InfoQueue as _,
             );
             if let Some(info_queue) = info_queue.as_ref() {
-                println!("D3D debug layer active");
+                info!("D3D debug layer active");
                 info_queue.SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_CORRUPTION, 1);
                 info_queue.SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_ERROR, 1);
                 info_queue.SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_WARNING, 1);
@@ -294,7 +295,7 @@ impl GraphicsD3D11 {
         assert!(new_dim.0 < 16384);
         assert!(new_dim.1 < 16384);
 
-        println!("update_backbuffer {:?}", new_dim);
+        debug!("update_backbuffer {:?}", new_dim);
 
         let hr: HRESULT = unsafe {
             self.swapchain.ResizeBuffers(

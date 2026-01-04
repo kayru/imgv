@@ -4,12 +4,12 @@
 
 use cgmath::{assert_ulps_eq, prelude::*};
 use com_ptr::{hresult, ComPtr};
+use log::{debug, error, info, warn};
 use std::ffi::OsString;
-use std::os::windows::ffi::OsStrExt;
-use std::os::windows::prelude::*;
+use std::os::windows::ffi::OsStringExt;
 use std::ptr::null_mut;
 use std::time::{Duration, Instant};
-use std::{ffi::OsStr, path::Path, path::PathBuf};
+use std::{path::Path, path::PathBuf};
 use winapi::ctypes::c_void;
 use winapi::shared::dxgi::*;
 use winapi::shared::dxgi1_2::*;
@@ -43,20 +43,20 @@ use capture::*;
 mod clipboard;
 use clipboard::*;
 
-const VERBOSE_LOG: bool = false;
+mod logging;
+use logging::{init_logging, maybe_alloc_console};
+
+mod window;
+use window::*;
+
+mod loader;
+use loader::load_image_with_metadata;
+
+mod browse;
+use browse::{get_next_file, StepDirection};
 
 const WINDOW_MIN_WIDTH: i32 = 320;
 const WINDOW_MIN_HEIGHT: i32 = 240;
-
-trait Dimensions {
-    fn dim(&self) -> (i32, i32);
-}
-
-impl Dimensions for RECT {
-    fn dim(&self) -> (i32, i32) {
-        (self.right - self.left, self.bottom - self.top)
-    }
-}
 
 struct WindowCreatedData {
     hwnd: HWND,
@@ -82,15 +82,6 @@ enum WindowMessages {
 
 unsafe impl std::marker::Send for WindowCreatedData {}
 
-fn make_empty_rect() -> RECT {
-    RECT {
-        left: 0,
-        right: 0,
-        top: 0,
-        bottom: 0,
-    }
-}
-
 struct Window {
     message_rx: std::sync::mpsc::Receiver<WindowMessages>,
     hwnd: HWND,
@@ -104,73 +95,6 @@ struct Window {
 struct WindowThreadState {
     message_tx: std::sync::mpsc::Sender<WindowMessages>,
     is_window_closed: bool,
-}
-
-fn get_screen_dimensions() -> (i32, i32) {
-    unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
-}
-
-fn get_client_rect_absolute(hwnd: HWND) -> RECT {
-    let mut client_rect = make_empty_rect();
-    unsafe {
-        GetClientRect(hwnd, &mut client_rect);
-    }
-    client_rect
-}
-
-fn get_window_rect_absolute(hwnd: HWND) -> RECT {
-    let mut window_rect = make_empty_rect();
-    unsafe {
-        GetWindowRect(hwnd, &mut window_rect);
-    }
-    window_rect
-}
-
-fn get_client_rect(hwnd: HWND) -> RECT {
-    let mut client_rect = make_empty_rect();
-    unsafe {
-        let mut window_rect = make_empty_rect();
-        GetWindowRect(hwnd, &mut window_rect);
-        GetClientRect(hwnd, &mut client_rect);
-        client_rect.left += window_rect.left;
-        client_rect.right += window_rect.left;
-        client_rect.top += window_rect.top;
-        client_rect.bottom += window_rect.top;
-    }
-    client_rect
-}
-
-fn get_window_client_rect_dimensions(hwnd: HWND) -> (i32, i32) {
-    let client_rect = get_client_rect(hwnd);
-    (
-        client_rect.right - client_rect.left,
-        client_rect.bottom - client_rect.top,
-    )
-}
-
-fn compute_client_rect(dim: (i32, i32)) -> RECT {
-    let screen_dim = get_screen_dimensions();
-    let window_pos = (screen_dim.0 / 2 - dim.0 / 2, screen_dim.1 / 2 - dim.1 / 2);
-    RECT {
-        left: window_pos.0,
-        top: window_pos.1,
-        right: window_pos.0 + dim.0,
-        bottom: window_pos.1 + dim.1,
-    }
-}
-
-fn get_desktop_work_area() -> RECT {
-    let dim = unsafe {
-        let ix = GetSystemMetrics(SM_CXMAXIMIZED);
-        let iy = GetSystemMetrics(SM_CYMAXIMIZED);
-        (ix, iy)
-    };
-    RECT {
-        left: 0,
-        top: 0,
-        right: dim.0,
-        bottom: dim.1,
-    }
 }
 
 unsafe extern "system" fn window_proc(
@@ -253,13 +177,6 @@ unsafe extern "system" fn window_proc(
     };
 
     DefWindowProcW(hwnd, msg, wparam, lparam)
-}
-
-fn to_wide_string(s: &str) -> Vec<u16> {
-    OsStr::new(s)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<u16>>()
 }
 
 impl Window {
@@ -496,49 +413,6 @@ fn decode_mouse_pos(lparam: isize) -> float2 {
     float2 { x, y }
 }
 
-#[derive(Debug, PartialEq)]
-enum StepDirection {
-    Backward,
-    Forward,
-}
-
-fn is_compatible_file(path: &Path) -> bool {
-    let extensions = [
-        "jpg", "jpeg", "png", "gif", "webp", "tif", "tiff", "tga", "dds", "bmp", "ico", "hdr",
-        "pbm", "pam", "ppm", "pgm", "ff",
-    ];
-    if let Some(ext) = path.extension() {
-        let ext = ext.to_string_lossy().to_ascii_lowercase();
-        for it in &extensions {
-            if *it == ext {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn get_next_file(path: &Path, direction: StepDirection) -> Option<PathBuf> {
-    let file_dir = path.parent().unwrap();
-    let file_name = path.file_name().unwrap();
-    let dir = std::fs::read_dir(file_dir);
-    if let Ok(dir) = dir {
-        let files: Vec<_> = dir
-            .filter_map(|f| f.ok().map(|f| f.path()))
-            .filter(|f| is_compatible_file(f))
-            .map(|f| f.file_name().unwrap().to_owned())
-            .collect();
-        if let Some(i) = files.iter().position(|f| f == file_name) {
-            return match direction {
-                StepDirection::Backward if i > 0 => Some(files[i - 1].clone().into()),
-                StepDirection::Forward if i + 1 < files.len() => Some(files[i + 1].clone().into()),
-                _ => None,
-            };
-        }
-    }
-    None
-}
-
 fn to_milliseconds(t: Duration) -> f32 {
     t.as_secs_f32() * 1000.0
 }
@@ -615,16 +489,30 @@ fn main() {
     let main_begin_time = Instant::now();
 
     let mut image_path: Option<PathBuf> = None;
+    let mut verbose_log = false;
+    let mut console_requested = false;
 
     let (load_req_tx, load_req_rx) = std::sync::mpsc::channel();
     let (image_tx, image_rx) = std::sync::mpsc::channel();
 
-    if std::env::args().len() > 1 {
-        let args: Vec<String> = std::env::args().collect();
-        let path: PathBuf = args[1].clone().into();
-        image_path = Some(path.clone());
-        load_req_tx.send(path).unwrap();
+    for arg in std::env::args().skip(1) {
+        if arg == "-v" || arg == "--verbose" {
+            verbose_log = true;
+            continue;
+        }
+        if arg == "--console" {
+            console_requested = true;
+            continue;
+        }
+        if image_path.is_none() {
+            let path: PathBuf = arg.into();
+            image_path = Some(path.clone());
+            load_req_tx.send(path).unwrap();
+        }
     }
+
+    maybe_alloc_console(console_requested);
+    init_logging(verbose_log);
 
     let mut state = ViewerState::new();
 
@@ -634,19 +522,19 @@ fn main() {
         while let Ok(x) = load_req_rx.recv() {
             profiling::scope!("LoadImage");
             let load_begin_time = Instant::now();
-            println!("Loading image {:?}", x);
-            let img = image::open(&x);
+            info!("Loading image {:?}", x);
+            let img = load_image_with_metadata(&x);
             let _ = image_tx.send((img, load_begin_time, x));
             unsafe {
                 InvalidateRect(main_window_handle as HWND, null_mut(), 1);
             }
         }
-        println!("Loading thread done");
+        info!("Loading thread done");
     });
 
     {
         let window_time = Instant::now() - main_begin_time;
-        println!("Time to window: {} ms", to_milliseconds(window_time));
+        info!("Time to window: {} ms", to_milliseconds(window_time));
     }
 
     let mut graphics: GraphicsD3D11 = unsafe { GraphicsD3D11::new(main_window.hwnd).unwrap() };
@@ -708,7 +596,7 @@ fn main() {
                             "Hitch",
                             format!("{} ms", to_milliseconds(latency)).as_str()
                         );
-                        println!("Hitch: {} ms", to_milliseconds(latency));
+                        warn!("Hitch: {} ms", to_milliseconds(latency));
                         last_verbose_log_time = Instant::now();
                     }
                     let lparam = native_msg.lparam;
@@ -844,7 +732,7 @@ fn main() {
                                             img,
                                             Some("Clipboard Image"),
                                         );
-                                        println!(
+                                        info!(
                                             "Loaded clipboard image {:?}x{:?}",
                                             dim.0, dim.1
                                         );
@@ -935,18 +823,27 @@ fn main() {
                     &mut main_window,
                     &graphics,
                     &mut constants,
-                    img,
+                    img.image,
                     Some(&image_name),
                 );
 
+                if img.exif.is_some() || img.icc_profile.is_some() || img.orientation.is_some() {
+                    info!(
+                        "Metadata: exif={} bytes, icc={} bytes, orientation={:?}",
+                        img.exif.as_ref().map_or(0, |v| v.len()),
+                        img.icc_profile.as_ref().map_or(0, |v| v.len()),
+                        img.orientation
+                    );
+                }
+
                 let image_load_time = Instant::now() - load_begin_time;
-                println!(
+                info!(
                     "Time to load image {} ms ({:?})",
                     to_milliseconds(image_load_time),
                     dim
                 );
             } else {
-                println!("Failed to load image: {:?}", img.err());
+                error!("Failed to load image: {:?}", img.err());
             };
 
             unsafe {
@@ -956,17 +853,17 @@ fn main() {
 
         if state.frame_number == 0 {
             let init_time = Instant::now() - main_begin_time;
-            println!("Init time: {:.2}ms", to_milliseconds(init_time));
+            info!("Init time: {:.2}ms", to_milliseconds(init_time));
         }
 
         unsafe {
             profiling::scope!("Draw");
 
-            if VERBOSE_LOG {
+            if verbose_log {
                 let frame_delta_time = Instant::now() - last_frame_draw_time;
                 last_frame_draw_time = Instant::now();
                 let draw_time = draw_end_time - draw_begin_time;
-                println!(
+                debug!(
                     "Draw dt: {:.2}ms, frame_number: {}, handled_events: {}, draw time: {:.2}ms",
                     to_milliseconds(frame_delta_time),
                     state.frame_number,
