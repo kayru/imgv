@@ -1,6 +1,4 @@
 use crate::window::to_wide_string;
-use env_logger;
-use log;
 use std::ptr::null_mut;
 use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
 use winapi::um::handleapi::INVALID_HANDLE_VALUE;

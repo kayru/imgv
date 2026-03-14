@@ -43,9 +43,23 @@ const DXGI_MWA_NO_PRINT_SCREEN: UINT = 4;
 pub struct Constants {
     pub image_dim: float2,
     pub window_dim: float2,
-    pub mouse: float4, // float2 xy pos, uint buttons, uint unused
+    pub mouse_pos: float2,
+    pub mouse_buttons: u32,
+    pub show_transparency: u32,
     pub xfm_viewport_to_image_uv: float4,
+    pub image_type: u32,     // 0 = 2d/2darray, 1 = 3d
+    pub current_slice: u32,
+    pub current_mip: u32,
+    pub slice_count: u32,
+    pub premultiplied_alpha: u32,
+    pub _pad: [u32; 3],
 }
+
+#[allow(clippy::manual_is_multiple_of)]
+const _: () = assert!(
+    std::mem::size_of::<Constants>() % 16 == 0,
+    "Constants must be a multiple of 16 bytes for D3D11 constant buffers"
+);
 
 pub struct BackBuffer {
     pub rtv: ComPtr<ID3D11RenderTargetView>,
@@ -64,6 +78,8 @@ pub struct GraphicsD3D11 {
     pub constants: ComPtr<ID3D11Buffer>,
     pub smp_linear: ComPtr<ID3D11SamplerState>,
     pub smp_point: ComPtr<ID3D11SamplerState>,
+    pub dummy_srv_2d_array: ComPtr<ID3D11ShaderResourceView>,
+    pub dummy_srv_3d: ComPtr<ID3D11ShaderResourceView>,
     swap_chain_waitable: Option<winapi::shared::ntdef::HANDLE>,
     frame_statistics: DXGI_FRAME_STATISTICS,
 }
@@ -253,6 +269,60 @@ impl GraphicsD3D11 {
             }
         }
 
+        // Create 1x1 dummy textures for unused shader resource slots
+        let dummy_srv_2d_array = {
+            let mut tex: *mut ID3D11Texture2D = null_mut();
+            let mut srv: *mut ID3D11ShaderResourceView = null_mut();
+            let pixel: [u8; 4] = [0, 0, 0, 0];
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: 1, Height: 1, MipLevels: 1, ArraySize: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_IMMUTABLE,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE,
+                CPUAccessFlags: 0, MiscFlags: 0,
+            };
+            let data = D3D11_SUBRESOURCE_DATA {
+                pSysMem: pixel.as_ptr() as _, SysMemPitch: 4, SysMemSlicePitch: 0,
+            };
+            let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2DARRAY,
+                u: {
+                    let mut u: D3D11_SHADER_RESOURCE_VIEW_DESC_u = std::mem::zeroed();
+                    *u.Texture2DArray_mut() = D3D11_TEX2D_ARRAY_SRV {
+                        MostDetailedMip: 0, MipLevels: 1,
+                        FirstArraySlice: 0, ArraySize: 1,
+                    };
+                    u
+                },
+            };
+            device.CreateTexture2D(&desc, &data, &mut tex);
+            device.CreateShaderResourceView(tex as *mut ID3D11Resource, &srv_desc, &mut srv);
+            if !tex.is_null() { (*tex).Release(); }
+            ComPtr::from_raw(srv)
+        };
+
+        let dummy_srv_3d = {
+            let mut tex: *mut ID3D11Texture3D = null_mut();
+            let mut srv: *mut ID3D11ShaderResourceView = null_mut();
+            let pixel: [u8; 4] = [0, 0, 0, 0];
+            let desc = D3D11_TEXTURE3D_DESC {
+                Width: 1, Height: 1, Depth: 1, MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                Usage: D3D11_USAGE_IMMUTABLE,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE,
+                CPUAccessFlags: 0, MiscFlags: 0,
+            };
+            let data = D3D11_SUBRESOURCE_DATA {
+                pSysMem: pixel.as_ptr() as _, SysMemPitch: 4, SysMemSlicePitch: 4,
+            };
+            device.CreateTexture3D(&desc, &data, &mut tex);
+            device.CreateShaderResourceView(tex as *mut ID3D11Resource, null_mut(), &mut srv);
+            if !tex.is_null() { (*tex).Release(); }
+            ComPtr::from_raw(srv)
+        };
+
         let mut result = GraphicsD3D11 {
             device,
             info_queue: if info_queue.is_null() {
@@ -268,6 +338,8 @@ impl GraphicsD3D11 {
             constants,
             smp_linear: ComPtr::from_raw(smp_linear),
             smp_point: ComPtr::from_raw(smp_point),
+            dummy_srv_2d_array,
+            dummy_srv_3d,
             swap_chain_waitable,
             frame_statistics: std::mem::zeroed(),
         };
@@ -357,55 +429,323 @@ impl GraphicsD3D11 {
     }
 }
 
+pub struct DdsTextureData {
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub mip_count: u32,
+    pub array_size: u32,
+    pub dxgi_format: u32,
+    pub block_dim: u32,       // 4 for BCn, 1 for uncompressed
+    pub block_byte_size: u32, // bytes per block (BCn) or per pixel (uncompressed)
+    pub premultiplied_alpha: bool,
+    pub data: Vec<u8>,
+}
+
+pub struct DdsSlice {
+    pub width: u32,
+    pub height: u32,
+    pub dxgi_format: u32,
+    pub data_offset: usize,
+    pub row_pitch: u32,
+}
+
+impl DdsTextureData {
+    /// Compute the byte size of one 2D slice (one depth/array element) at a given mip.
+    fn mip_slice_size(&self, mip: u32) -> usize {
+        let mw = 1.max(self.width >> mip);
+        let mh = 1.max(self.height >> mip);
+        let bw = mw.div_ceil(self.block_dim) as usize;
+        let bh = mh.div_ceil(self.block_dim) as usize;
+        bw * bh * self.block_byte_size as usize
+    }
+
+    /// Row pitch in bytes at a given mip level.
+    fn mip_row_pitch(&self, mip: u32) -> u32 {
+        let mw = 1.max(self.width >> mip);
+        let bw = mw.div_ceil(self.block_dim);
+        bw * self.block_byte_size
+    }
+
+    pub fn get_slice(&self, array_or_depth: u32, mip: u32) -> Option<DdsSlice> {
+        if mip >= self.mip_count {
+            return None;
+        }
+
+        let is_volume = self.depth > 1;
+
+        if is_volume {
+            // Volume texture: data is laid out as all depth slices for mip 0,
+            // then all (halved) depth slices for mip 1, etc.
+            // All in a single contiguous block (array_size == 1 for volumes).
+            let mut offset: usize = 0;
+            for m in 0..mip {
+                let md = 1.max(self.depth >> m) as usize;
+                offset += self.mip_slice_size(m) * md;
+            }
+            let md = 1.max(self.depth >> mip);
+            if array_or_depth >= md {
+                return None;
+            }
+            let slice_size = self.mip_slice_size(mip);
+            offset += slice_size * array_or_depth as usize;
+            if offset + slice_size > self.data.len() {
+                return None;
+            }
+            Some(DdsSlice {
+                width: 1.max(self.width >> mip),
+                height: 1.max(self.height >> mip),
+                dxgi_format: self.dxgi_format,
+                data_offset: offset,
+                row_pitch: self.mip_row_pitch(mip),
+            })
+        } else {
+            // Array/single texture: data for each array layer contains all mips
+            // contiguously. Compute array stride (sum of all mip sizes).
+            if array_or_depth >= self.array_size {
+                return None;
+            }
+            let array_stride = self.compute_array_stride();
+            let mut offset = array_stride * array_or_depth as usize;
+            for m in 0..mip {
+                offset += self.mip_slice_size(m);
+            }
+            let slice_size = self.mip_slice_size(mip);
+            if offset + slice_size > self.data.len() {
+                return None;
+            }
+            Some(DdsSlice {
+                width: 1.max(self.width >> mip),
+                height: 1.max(self.height >> mip),
+                dxgi_format: self.dxgi_format,
+                data_offset: offset,
+                row_pitch: self.mip_row_pitch(mip),
+            })
+        }
+    }
+
+    fn compute_array_stride(&self) -> usize {
+        let mut stride: usize = 0;
+        for m in 0..self.mip_count {
+            stride += self.mip_slice_size(m);
+        }
+        stride
+    }
+
+    pub fn depth_at_mip(&self, mip: u32) -> u32 {
+        if self.depth > 1 {
+            1.max(self.depth >> mip)
+        } else {
+            1
+        }
+    }
+}
+
+/// Map TYPELESS formats to a default typed format for SRV creation.
+/// D3D11 requires SRVs to use typed formats even if the resource is TYPELESS.
+fn srv_format_for(format: u32) -> u32 {
+    match format {
+        DXGI_FORMAT_R32G32B32A32_TYPELESS => DXGI_FORMAT_R32G32B32A32_FLOAT,
+        DXGI_FORMAT_R32G32B32_TYPELESS => DXGI_FORMAT_R32G32B32_FLOAT,
+        DXGI_FORMAT_R16G16B16A16_TYPELESS => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        DXGI_FORMAT_R32G32_TYPELESS => DXGI_FORMAT_R32G32_FLOAT,
+        DXGI_FORMAT_R10G10B10A2_TYPELESS => DXGI_FORMAT_R10G10B10A2_UNORM,
+        DXGI_FORMAT_R8G8B8A8_TYPELESS => DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_R16G16_TYPELESS => DXGI_FORMAT_R16G16_FLOAT,
+        DXGI_FORMAT_R32_TYPELESS => DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_R24G8_TYPELESS => DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+        DXGI_FORMAT_R8G8_TYPELESS => DXGI_FORMAT_R8G8_UNORM,
+        DXGI_FORMAT_R16_TYPELESS => DXGI_FORMAT_R16_FLOAT,
+        DXGI_FORMAT_R8_TYPELESS => DXGI_FORMAT_R8_UNORM,
+        DXGI_FORMAT_BC1_TYPELESS => DXGI_FORMAT_BC1_UNORM,
+        DXGI_FORMAT_BC2_TYPELESS => DXGI_FORMAT_BC2_UNORM,
+        DXGI_FORMAT_BC3_TYPELESS => DXGI_FORMAT_BC3_UNORM,
+        DXGI_FORMAT_BC4_TYPELESS => DXGI_FORMAT_BC4_UNORM,
+        DXGI_FORMAT_BC5_TYPELESS => DXGI_FORMAT_BC5_UNORM,
+        DXGI_FORMAT_B8G8R8A8_TYPELESS => DXGI_FORMAT_B8G8R8A8_UNORM,
+        DXGI_FORMAT_B8G8R8X8_TYPELESS => DXGI_FORMAT_B8G8R8X8_UNORM,
+        DXGI_FORMAT_BC6H_TYPELESS => DXGI_FORMAT_BC6H_UF16,
+        DXGI_FORMAT_BC7_TYPELESS => DXGI_FORMAT_BC7_UNORM,
+        other => other,
+    }
+}
+
+pub enum ImageType {
+    Image2DArray, // t0
+    Volume,       // t1
+}
+
 pub struct Texture {
-    pub tex: ComPtr<ID3D11Texture2D>,
     pub srv: ComPtr<ID3D11ShaderResourceView>,
     pub dim: (u32, u32),
+    pub image_type: ImageType,
 }
 
 impl Texture {
-    pub fn new(device: &ComPtr<ID3D11Device>, image: image::DynamicImage) -> Self {
-        let mut image_tex: *mut ID3D11Texture2D = null_mut();
-        let mut image_srv: *mut ID3D11ShaderResourceView = null_mut();
+    pub fn new(device: &ComPtr<ID3D11Device>, image: image::DynamicImage) -> Option<Self> {
         let img_buf = image.into_rgba8();
         let dim = img_buf.dimensions();
         let img_container = img_buf.as_raw();
-        let texture_desc = D3D11_TEXTURE2D_DESC {
+        let subresource = D3D11_SUBRESOURCE_DATA {
+            pSysMem: img_container.as_ptr() as *mut c_void,
+            SysMemPitch: 4 * dim.0,
+            SysMemSlicePitch: 0,
+        };
+        Self::create_texture_2d_array(device, dim, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, &[subresource])
+    }
+
+    pub fn from_dds(device: &ComPtr<ID3D11Device>, dds: &DdsTextureData) -> Option<Self> {
+        if dds.depth > 1 {
+            Self::create_texture_3d(device, dds)
+        } else {
+            Self::create_texture_2d_array_from_dds(device, dds)
+        }
+    }
+
+    fn create_texture_2d_array_from_dds(
+        device: &ComPtr<ID3D11Device>,
+        dds: &DdsTextureData,
+    ) -> Option<Self> {
+        // Subresources: for each array slice, then for each mip level
+        // D3D11 expects subresource index = mip + (array_index * mip_count)
+        let mut subresources = Vec::new();
+        for array_idx in 0..dds.array_size {
+            for mip in 0..dds.mip_count {
+                let slice = dds.get_slice(array_idx, mip)?;
+                subresources.push(D3D11_SUBRESOURCE_DATA {
+                    pSysMem: dds.data[slice.data_offset..].as_ptr() as *mut c_void,
+                    SysMemPitch: slice.row_pitch,
+                    SysMemSlicePitch: 0,
+                });
+            }
+        }
+        Self::create_texture_2d_array(
+            device,
+            (dds.width, dds.height),
+            dds.array_size,
+            dds.mip_count,
+            dds.dxgi_format,
+            &subresources,
+        )
+    }
+
+    fn create_texture_2d_array(
+        device: &ComPtr<ID3D11Device>,
+        dim: (u32, u32),
+        array_size: u32,
+        mip_levels: u32,
+        format: u32,
+        subresources: &[D3D11_SUBRESOURCE_DATA],
+    ) -> Option<Self> {
+        let mut tex: *mut ID3D11Texture2D = null_mut();
+        let mut srv: *mut ID3D11ShaderResourceView = null_mut();
+        let desc = D3D11_TEXTURE2D_DESC {
             Width: dim.0,
             Height: dim.1,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
+            MipLevels: mip_levels,
+            ArraySize: array_size,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Usage: D3D11_USAGE_IMMUTABLE,
             BindFlags: D3D11_BIND_SHADER_RESOURCE,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
-        let image_data = D3D11_SUBRESOURCE_DATA {
-            pSysMem: img_container.as_ptr() as *mut c_void,
-            SysMemPitch: 4 * texture_desc.Width,
-            SysMemSlicePitch: 0,
+        let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+            Format: srv_format_for(format),
+            ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2DARRAY,
+            u: unsafe {
+                let mut u: D3D11_SHADER_RESOURCE_VIEW_DESC_u = std::mem::zeroed();
+                *u.Texture2DArray_mut() = D3D11_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: mip_levels,
+                    FirstArraySlice: 0,
+                    ArraySize: array_size,
+                };
+                u
+            },
         };
         unsafe {
-            device.CreateTexture2D(
-                &texture_desc as *const D3D11_TEXTURE2D_DESC,
-                &image_data as *const D3D11_SUBRESOURCE_DATA,
-                &mut image_tex as *mut *mut ID3D11Texture2D,
-            );
+            device.CreateTexture2D(&desc, subresources.as_ptr(), &mut tex);
+            if tex.is_null() {
+                return None;
+            }
             device.CreateShaderResourceView(
-                image_tex as *mut ID3D11Resource,
-                null_mut(),
-                &mut image_srv as *mut *mut ID3D11ShaderResourceView,
+                tex as *mut ID3D11Resource,
+                &srv_desc,
+                &mut srv,
             );
+            (*tex).Release();
+            if srv.is_null() {
+                return None;
+            }
         };
-        Self {
-            tex: unsafe { ComPtr::from_raw(image_tex) },
-            srv: unsafe { ComPtr::from_raw(image_srv) },
+        Some(Self {
+            srv: unsafe { ComPtr::from_raw(srv) },
             dim,
+            image_type: ImageType::Image2DArray,
+        })
+    }
+
+    fn create_texture_3d(device: &ComPtr<ID3D11Device>, dds: &DdsTextureData) -> Option<Self> {
+        // For 3D textures, subresources are indexed by mip level only.
+        // Each mip's data contains all depth slices contiguously.
+        let mut subresources = Vec::new();
+        for mip in 0..dds.mip_count {
+            let row_pitch = dds.mip_row_pitch(mip);
+            let slice_pitch = dds.mip_slice_size(mip) as u32;
+            let first_depth_slice = dds.get_slice(0, mip)?;
+            subresources.push(D3D11_SUBRESOURCE_DATA {
+                pSysMem: dds.data[first_depth_slice.data_offset..].as_ptr() as *mut c_void,
+                SysMemPitch: row_pitch,
+                SysMemSlicePitch: slice_pitch,
+            });
         }
+
+        let mut tex: *mut ID3D11Texture3D = null_mut();
+        let mut srv: *mut ID3D11ShaderResourceView = null_mut();
+        let desc = D3D11_TEXTURE3D_DESC {
+            Width: dds.width,
+            Height: dds.height,
+            Depth: dds.depth,
+            MipLevels: dds.mip_count,
+            Format: dds.dxgi_format,
+            Usage: D3D11_USAGE_IMMUTABLE,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+            Format: srv_format_for(dds.dxgi_format),
+            ViewDimension: D3D11_SRV_DIMENSION_TEXTURE3D,
+            u: unsafe {
+                let mut u: D3D11_SHADER_RESOURCE_VIEW_DESC_u = std::mem::zeroed();
+                *u.Texture3D_mut() = D3D11_TEX3D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: dds.mip_count,
+                };
+                u
+            },
+        };
+        unsafe {
+            device.CreateTexture3D(&desc, subresources.as_ptr(), &mut tex);
+            if tex.is_null() {
+                return None;
+            }
+            device.CreateShaderResourceView(
+                tex as *mut ID3D11Resource,
+                &srv_desc,
+                &mut srv,
+            );
+            (*tex).Release();
+            if srv.is_null() {
+                return None;
+            }
+        };
+        Some(Self {
+            srv: unsafe { ComPtr::from_raw(srv) },
+            dim: (dds.width, dds.height),
+            image_type: ImageType::Volume,
+        })
     }
 }

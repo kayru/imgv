@@ -34,6 +34,7 @@ winapi = { version = "0.3.9", features = [
     ]}
 
 anyhow = "1.0.100"
+ddsfile = "0.5"
 display-info = "0.5.7"
 env_logger = "0.11.6"
 icc-profile = "0.0.2"

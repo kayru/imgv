@@ -50,7 +50,7 @@ mod window;
 use window::*;
 
 mod loader;
-use loader::load_image_with_metadata;
+use loader::{load_image_with_metadata, ImageData};
 
 mod browse;
 use browse::{get_next_file, StepDirection};
@@ -426,6 +426,10 @@ struct ViewerState {
     mouse_pos: float2,
     viewport_dim: float2,
     image_dim: float2,
+    show_transparency: bool,
+    dds_data: Option<DdsTextureData>,
+    dds_slice: u32,
+    dds_mip: u32,
     xfm_window_to_image: Transform2D,
 }
 
@@ -440,6 +444,10 @@ impl ViewerState {
             mouse_pos: FLOAT2_ZERO,
             viewport_dim: FLOAT2_ZERO,
             image_dim: FLOAT2_ZERO,
+            show_transparency: false,
+            dds_data: None,
+            dds_slice: 0,
+            dds_mip: 0,
             xfm_window_to_image: Transform2D::new_identity(),
         }
     }
@@ -453,14 +461,12 @@ impl ViewerState {
 fn apply_loaded_image(
     state: &mut ViewerState,
     main_window: &mut Window,
-    graphics: &GraphicsD3D11,
     constants: &mut Constants,
-    img: image::DynamicImage,
+    texture: Texture,
     image_name: Option<&str>,
 ) -> (u32, u32) {
-    state.texture = Some(Texture::new(&graphics.device, img));
-
-    let dim = state.texture.as_ref().unwrap().dim;
+    let dim = texture.dim;
+    state.texture = Some(texture);
 
     let pending_image_dim: float2 = float2::new(dim.0 as f32, dim.1 as f32);
     if constants.image_dim != pending_image_dim {
@@ -481,6 +487,47 @@ fn apply_loaded_image(
     }
 
     dim
+}
+
+fn update_dds_view(
+    state: &mut ViewerState,
+    constants: &mut Constants,
+    main_window: &mut Window,
+) {
+    let dds = state.dds_data.as_ref().unwrap();
+    let is_volume = dds.depth > 1;
+
+    // For volume textures, depth shrinks with mip level
+    if is_volume {
+        let max_depth = dds.depth_at_mip(state.dds_mip);
+        if state.dds_slice >= max_depth {
+            state.dds_slice = max_depth - 1;
+        }
+    }
+
+    constants.current_slice = state.dds_slice;
+    constants.current_mip = state.dds_mip;
+    constants.slice_count = if is_volume {
+        dds.depth_at_mip(state.dds_mip)
+    } else {
+        dds.array_size
+    };
+
+    let label = if is_volume {
+        format!(
+            "DDS depth {}/{} mip {}/{}",
+            state.dds_slice + 1, constants.slice_count,
+            state.dds_mip + 1, dds.mip_count,
+        )
+    } else {
+        format!(
+            "DDS slice {}/{} mip {}/{}",
+            state.dds_slice + 1, dds.array_size,
+            state.dds_mip + 1, dds.mip_count,
+        )
+    };
+    info!("{}", label);
+    main_window.set_window_name(&label);
 }
 
 fn main() {
@@ -549,8 +596,16 @@ fn main() {
     let mut constants = Constants {
         image_dim: FLOAT2_ZERO,
         window_dim: FLOAT2_ZERO,
-        mouse: FLOAT4_ZERO,
+        mouse_pos: FLOAT2_ZERO,
+        mouse_buttons: 0,
+        show_transparency: 0,
         xfm_viewport_to_image_uv: Transform2D::new_identity().into(),
+        image_type: 0,
+        current_slice: 0,
+        current_mip: 0,
+        slice_count: 1,
+        premultiplied_alpha: 0,
+        _pad: [0; 3],
     };
 
     let switch_to_next_image = |current_image_path: &Path, direction: StepDirection| {
@@ -656,8 +711,7 @@ fn main() {
                         }
                         WM_MOUSEMOVE => {
                             state.mouse_pos = decode_mouse_pos(lparam);
-                            constants.mouse.x = state.mouse_pos.x;
-                            constants.mouse.y = state.mouse_pos.y;
+                            constants.mouse_pos = state.mouse_pos;
                             let drag_delta: float2 = state.drag_origin - state.mouse_pos;
                             if state.is_dragging {
                                 state.xfm_window_to_image.offset =
@@ -698,25 +752,20 @@ fn main() {
                                 (VK_RETURN, _) => {
                                     main_window.set_full_screen(!main_window.full_screen);
                                 }
-                                (_, '1') => {
-                                    let s = 1.0;
-                                    state.xfm_window_to_image.scale = float2::new(s, s);
-                                }
-                                (_, '2') => {
-                                    let s = 1.0 / 2.0;
-                                    state.xfm_window_to_image.scale = float2::new(s, s);
-                                }
-                                (_, '3') => {
-                                    let s = 1.0 / 4.0;
-                                    state.xfm_window_to_image.scale = float2::new(s, s);
-                                }
-                                (_, '4') => {
-                                    let s = 1.0 / 8.0;
-                                    state.xfm_window_to_image.scale = float2::new(s, s);
-                                }
-                                (_, '5') => {
-                                    let s = 1.0 / 16.0;
-                                    state.xfm_window_to_image.scale = float2::new(s, s);
+                                (_, '1') | (_, '2') | (_, '3') | (_, '4') | (_, '5') => {
+                                    let s = match wparam as u8 as char {
+                                        '1' => 1.0,
+                                        '2' => 1.0 / 2.0,
+                                        '3' => 1.0 / 4.0,
+                                        '4' => 1.0 / 8.0,
+                                        '5' => 1.0 / 16.0,
+                                        _ => unreachable!(),
+                                    };
+                                    let scale = float2::new(s, s);
+                                    state.xfm_window_to_image.scale = scale;
+                                    state.xfm_window_to_image.offset =
+                                        0.5 * constants.image_dim
+                                        - 0.5 * state.viewport_dim.mul_element_wise(scale);
                                 }
                                 (_, 'V') if ctrl_down => {
                                     if let Ok(Some(path)) = get_clipboard_file_path() {
@@ -724,22 +773,82 @@ fn main() {
                                         load_req_tx.send(path).unwrap();
                                     } else if let Ok(Some(img)) = get_clipboard_image() {
                                         image_path = None;
-                                        let dim = apply_loaded_image(
-                                            &mut state,
-                                            &mut main_window,
-                                            &graphics,
-                                            &mut constants,
-                                            img,
-                                            Some("Clipboard Image"),
-                                        );
-                                        info!(
-                                            "Loaded clipboard image {:?}x{:?}",
-                                            dim.0, dim.1
-                                        );
+                                        state.dds_data = None;
+                                        state.dds_slice = 0;
+                                        state.dds_mip = 0;
+                                        constants.image_type = 0;
+                                        constants.current_slice = 0;
+                                        constants.current_mip = 0;
+                                        constants.slice_count = 1;
+                                        constants.premultiplied_alpha = 0;
+                                        if let Some(texture) = Texture::new(&graphics.device, img) {
+                                            let dim = apply_loaded_image(
+                                                &mut state,
+                                                &mut main_window,
+                                                &mut constants,
+                                                texture,
+                                                Some("Clipboard Image"),
+                                            );
+                                            info!(
+                                                "Loaded clipboard image {:?}x{:?}",
+                                                dim.0, dim.1
+                                            );
+                                        } else {
+                                            error!("Failed to create texture from clipboard image");
+                                        }
                                     }
                                 }
                                 (_, 'C') | (VK_INSERT, _) if ctrl_down => {
                                     main_window.clipboard_save();
+                                }
+                                (_, 'T') => {
+                                    state.show_transparency = !state.show_transparency;
+                                    constants.show_transparency = state.show_transparency as u32;
+                                }
+                                (VK_UP, _) if ctrl_down && state.dds_data.is_some() => {
+                                    if state.dds_mip > 0 {
+                                        state.dds_mip -= 1;
+                                        update_dds_view(
+                                            &mut state, &mut constants, &mut main_window,
+                                        );
+                                    }
+                                }
+                                (VK_DOWN, _) if ctrl_down && state.dds_data.is_some() => {
+                                    let mip_count = state.dds_data.as_ref().unwrap().mip_count;
+                                    if state.dds_mip + 1 < mip_count {
+                                        state.dds_mip += 1;
+                                        update_dds_view(
+                                            &mut state, &mut constants, &mut main_window,
+                                        );
+                                    }
+                                }
+                                (VK_UP, _) if state.dds_data.is_some() => {
+                                    let dds = state.dds_data.as_ref().unwrap();
+                                    let total = if dds.depth > 1 {
+                                        dds.depth_at_mip(state.dds_mip)
+                                    } else {
+                                        dds.array_size
+                                    };
+                                    if state.dds_slice > 0 {
+                                        state.dds_slice -= 1;
+                                    } else {
+                                        state.dds_slice = total - 1;
+                                    }
+                                    update_dds_view(
+                                        &mut state, &mut constants, &mut main_window,
+                                    );
+                                }
+                                (VK_DOWN, _) if state.dds_data.is_some() => {
+                                    let dds = state.dds_data.as_ref().unwrap();
+                                    let total = if dds.depth > 1 {
+                                        dds.depth_at_mip(state.dds_mip)
+                                    } else {
+                                        dds.array_size
+                                    };
+                                    state.dds_slice = (state.dds_slice + 1) % total;
+                                    update_dds_view(
+                                        &mut state, &mut constants, &mut main_window,
+                                    );
                                 }
                                 _ => {}
                             }
@@ -816,14 +925,46 @@ fn main() {
 
         if let Ok((img, load_begin_time, image_filename)) = image_rx.try_recv() {
             if let Ok(img) = img {
-                // Image loaded
                 let image_name = image_filename.to_string_lossy().into_owned();
+                let texture = match img.image_data {
+                    ImageData::Decoded(dynamic_image) => {
+                        state.dds_data = None;
+                        state.dds_slice = 0;
+                        state.dds_mip = 0;
+                        constants.image_type = 0;
+                        constants.current_slice = 0;
+                        constants.current_mip = 0;
+                        constants.slice_count = 1;
+                        constants.premultiplied_alpha = 0;
+                        Texture::new(&graphics.device, dynamic_image)
+                    }
+                    ImageData::Dds(dds_data) => {
+                        let tex = Texture::from_dds(&graphics.device, &dds_data);
+                        let is_volume = dds_data.depth > 1;
+                        constants.image_type = if is_volume { 1 } else { 0 };
+                        constants.current_slice = 0;
+                        constants.current_mip = 0;
+                        constants.slice_count = if is_volume {
+                            dds_data.depth
+                        } else {
+                            dds_data.array_size
+                        };
+                        constants.premultiplied_alpha = dds_data.premultiplied_alpha as u32;
+                        state.dds_slice = 0;
+                        state.dds_mip = 0;
+                        state.dds_data = Some(dds_data);
+                        tex
+                    }
+                };
+                let Some(texture) = texture else {
+                    error!("Failed to create texture for {:?}", image_filename);
+                    continue;
+                };
                 let dim = apply_loaded_image(
                     &mut state,
                     &mut main_window,
-                    &graphics,
                     &mut constants,
-                    img.image,
+                    texture,
                     Some(&image_name),
                 );
 
@@ -945,12 +1086,15 @@ fn main() {
             context.ClearRenderTargetView(backbuffer.rtv.as_ptr(), &clear_color);
 
             let cbvs: [*mut ID3D11Buffer; 1] = [graphics.constants.as_ptr()];
-            let srvs: [*mut ID3D11ShaderResourceView; 1] =
-                [if let Some(texture) = &state.texture {
-                    texture.srv.as_ptr()
-                } else {
-                    null_mut()
-                }];
+            let (srv_array, srv_volume) = if let Some(texture) = &state.texture {
+                match texture.image_type {
+                    ImageType::Image2DArray => (texture.srv.as_ptr(), graphics.dummy_srv_3d.as_ptr()),
+                    ImageType::Volume => (graphics.dummy_srv_2d_array.as_ptr(), texture.srv.as_ptr()),
+                }
+            } else {
+                (graphics.dummy_srv_2d_array.as_ptr(), graphics.dummy_srv_3d.as_ptr())
+            };
+            let srvs: [*mut ID3D11ShaderResourceView; 2] = [srv_array, srv_volume];
             let samplers: [*mut ID3D11SamplerState; 3] = [
                 graphics.smp_linear.as_ptr(), // g_default_sampler
                 graphics.smp_linear.as_ptr(), // g_linear_sampler
