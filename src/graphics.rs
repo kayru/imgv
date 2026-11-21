@@ -94,8 +94,14 @@ impl Drop for GraphicsD3D11 {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DeviceType {
+    Hardware,
+    Warp,
+}
+
 impl GraphicsD3D11 {
-    pub unsafe fn new(hwnd: HWND) -> Result<Self, ()> {
+    pub unsafe fn new(hwnd: HWND, device_type: DeviceType) -> Result<Self, ()> {
         let device_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | {
             D3D11_CREATE_DEVICE_DEBUG * cfg!(debug_assertions) as u32
         };
@@ -126,7 +132,10 @@ impl GraphicsD3D11 {
 
         let hr: HRESULT = D3D11CreateDevice(
             null_mut(),
-            D3D_DRIVER_TYPE_HARDWARE,
+            match device_type {
+                DeviceType::Hardware => D3D_DRIVER_TYPE_HARDWARE,
+                DeviceType::Warp => D3D_DRIVER_TYPE_WARP,
+            },
             null_mut(),
             device_flags,
             &feature_levels,

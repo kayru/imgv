@@ -538,6 +538,7 @@ fn main() {
     let mut image_path: Option<PathBuf> = None;
     let mut verbose_log = false;
     let mut console_requested = false;
+    let mut device_type = DeviceType::Hardware;
 
     let (load_req_tx, load_req_rx) = std::sync::mpsc::channel();
     let (image_tx, image_rx) = std::sync::mpsc::channel();
@@ -551,6 +552,12 @@ fn main() {
             console_requested = true;
             continue;
         }
+
+        if arg == "--warp" {
+            device_type = DeviceType::Warp;
+            continue;
+        }
+
         if image_path.is_none() {
             let path: PathBuf = arg.into();
             image_path = Some(path.clone());
@@ -584,7 +591,7 @@ fn main() {
         info!("Time to window: {} ms", to_milliseconds(window_time));
     }
 
-    let mut graphics: GraphicsD3D11 = unsafe { GraphicsD3D11::new(main_window.hwnd).unwrap() };
+    let mut graphics: GraphicsD3D11 = unsafe { GraphicsD3D11::new(main_window.hwnd, device_type).unwrap() };
 
     // Delay showing the window until the first frame can be drawn to avoid showing default blank frame
     unsafe {
