@@ -237,9 +237,11 @@ pub fn capture_window(hwnd: isize) -> Result<image::RgbaImage> {
 
     let rgba_buf = chunks
         .concat()
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .take((w * h) as usize)
-        .flat_map(|bgra| [bgra[2], bgra[1], bgra[0], bgra[3]])
+        .flat_map(|&[b, g, r, a]| [r, g, b, a])
         .collect();
 
     image::RgbaImage::from_vec(w as u32, h as u32, rgba_buf)

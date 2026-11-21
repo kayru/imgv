@@ -46,6 +46,11 @@ fn main() {
         }
     }
 
+    // superluminal-perf-sys ships PerformanceAPI_MD.lib without its PDB.
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/ignore:4099");
+    }
+
     let icon_filename = make_icon();
     if cfg!(target_os = "windows") {
         let mut res = winres::WindowsResource::new();
