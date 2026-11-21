@@ -1,8 +1,9 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use winapi::shared::windef::{HWND, RECT};
+use winapi::shared::windef::{HWND, POINT, RECT};
 use winapi::um::winuser::{
-    GetClientRect, GetSystemMetrics, GetWindowRect, SM_CXMAXIMIZED, SM_CXSCREEN, SM_CYMAXIMIZED,
+    ClientToScreen, GetClientRect, GetMonitorInfoW, GetSystemMetrics, MonitorFromWindow,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, SM_CXSCREEN,
     SM_CYSCREEN,
 };
 
@@ -35,26 +36,58 @@ pub fn get_client_rect_absolute(hwnd: HWND) -> RECT {
     client_rect
 }
 
-pub fn get_window_rect_absolute(hwnd: HWND) -> RECT {
-    let mut window_rect = make_empty_rect();
-    unsafe {
-        GetWindowRect(hwnd, &mut window_rect);
-    }
-    window_rect
-}
-
 pub fn get_client_rect(hwnd: HWND) -> RECT {
     let mut client_rect = make_empty_rect();
     unsafe {
-        let mut window_rect = make_empty_rect();
-        GetWindowRect(hwnd, &mut window_rect);
         GetClientRect(hwnd, &mut client_rect);
-        client_rect.left += window_rect.left;
-        client_rect.right += window_rect.left;
-        client_rect.top += window_rect.top;
-        client_rect.bottom += window_rect.top;
+        let mut origin = POINT { x: 0, y: 0 };
+        ClientToScreen(hwnd, &mut origin);
+        client_rect.left += origin.x;
+        client_rect.right += origin.x;
+        client_rect.top += origin.y;
+        client_rect.bottom += origin.y;
     }
     client_rect
+}
+
+fn get_monitor_info(hwnd: HWND) -> MONITORINFO {
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            rcMonitor: make_empty_rect(),
+            rcWork: make_empty_rect(),
+            dwFlags: 0,
+        };
+        GetMonitorInfoW(monitor, &mut info);
+        info
+    }
+}
+
+pub fn get_monitor_rect(hwnd: HWND) -> RECT {
+    get_monitor_info(hwnd).rcMonitor
+}
+
+pub fn get_monitor_work_rect(hwnd: HWND) -> RECT {
+    get_monitor_info(hwnd).rcWork
+}
+
+// WINDOWPLACEMENT positions are relative to the work area, which differs from the monitor
+// rect when an appbar such as the taskbar sits at the top or left.
+pub fn screen_to_workspace(hwnd: HWND, rect: RECT) -> RECT {
+    let info = get_monitor_info(hwnd);
+    let dx = info.rcWork.left - info.rcMonitor.left;
+    let dy = info.rcWork.top - info.rcMonitor.top;
+    RECT {
+        left: rect.left - dx,
+        top: rect.top - dy,
+        right: rect.right - dx,
+        bottom: rect.bottom - dy,
+    }
+}
+
+pub fn rects_equal(a: &RECT, b: &RECT) -> bool {
+    a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom
 }
 
 pub fn get_window_client_rect_dimensions(hwnd: HWND) -> (i32, i32) {
@@ -73,20 +106,6 @@ pub fn compute_client_rect(dim: (i32, i32)) -> RECT {
         top: window_pos.1,
         right: window_pos.0 + dim.0,
         bottom: window_pos.1 + dim.1,
-    }
-}
-
-pub fn get_desktop_work_area() -> RECT {
-    let dim = unsafe {
-        let ix = GetSystemMetrics(SM_CXMAXIMIZED);
-        let iy = GetSystemMetrics(SM_CYMAXIMIZED);
-        (ix, iy)
-    };
-    RECT {
-        left: 0,
-        top: 0,
-        right: dim.0,
-        bottom: dim.1,
     }
 }
 

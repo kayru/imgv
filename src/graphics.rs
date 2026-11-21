@@ -1,6 +1,6 @@
 use cgmath::{assert_ulps_eq, prelude::*};
 use com_ptr::{hresult, ComPtr};
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::prelude::*;
@@ -46,13 +46,14 @@ pub struct Constants {
     pub mouse_pos: float2,
     pub mouse_buttons: u32,
     pub show_transparency: u32,
-    pub xfm_viewport_to_image_uv: float4,
+    pub xfm_content_to_image_uv: float4,
     pub image_type: u32,     // 0 = 2d/2darray, 1 = 3d
     pub current_slice: u32,
     pub current_mip: u32,
     pub slice_count: u32,
     pub premultiplied_alpha: u32,
-    pub _pad: [u32; 3],
+    pub content_offset: [i32; 2],
+    pub _pad: u32,
 }
 
 #[allow(clippy::manual_is_multiple_of)]
@@ -71,6 +72,7 @@ pub struct GraphicsD3D11 {
     pub device: ComPtr<ID3D11Device>,
     info_queue: Option<ComPtr<ID3D11InfoQueue>>,
     pub context: ComPtr<ID3D11DeviceContext>,
+    dxgi_factory: ComPtr<IDXGIFactory2>,
     swapchain: ComPtr<IDXGISwapChain1>,
     pub backbuffer: Option<BackBuffer>,
     pub blit_vs: ComPtr<ID3D11VertexShader>,
@@ -82,6 +84,69 @@ pub struct GraphicsD3D11 {
     pub dummy_srv_3d: ComPtr<ID3D11ShaderResourceView>,
     swap_chain_waitable: Option<winapi::shared::ntdef::HANDLE>,
     frame_statistics: DXGI_FRAME_STATISTICS,
+    gpu_fence: Option<GpuFence>,
+}
+
+const GPU_WAIT_TIMEOUT_MS: u32 = 2000;
+
+struct GpuFence {
+    fence: windows::Win32::Graphics::Direct3D11::ID3D11Fence,
+    context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4,
+    event: windows::Win32::Foundation::HANDLE,
+    value: std::cell::Cell<u64>,
+}
+
+impl GpuFence {
+    unsafe fn new(device: *mut ID3D11Device, context: *mut ID3D11DeviceContext) -> Option<Self> {
+        use windows::Win32::Graphics::Direct3D11 as d3d;
+        use windows::core::Interface;
+
+        unsafe {
+            let device = d3d::ID3D11Device::from_raw_borrowed(&(device as *mut std::ffi::c_void))?
+                .cast::<d3d::ID3D11Device5>()
+                .ok()?;
+            let context = d3d::ID3D11DeviceContext::from_raw_borrowed(&(context as *mut std::ffi::c_void))?
+                .cast::<d3d::ID3D11DeviceContext4>()
+                .ok()?;
+            let mut fence: Option<d3d::ID3D11Fence> = None;
+            device
+                .CreateFence(0, d3d::D3D11_FENCE_FLAG_NONE, &mut fence)
+                .ok()?;
+            let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).ok()?;
+            Some(Self {
+                fence: fence?,
+                context,
+                event,
+                value: std::cell::Cell::new(0),
+            })
+        }
+    }
+
+    fn wait(&self) -> bool {
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+        use windows::Win32::System::Threading::WaitForSingleObject;
+
+        let value = self.value.get() + 1;
+        self.value.set(value);
+        unsafe {
+            if self.context.Signal(&self.fence, value).is_err() {
+                return false;
+            }
+            self.context.Flush();
+            if self.fence.SetEventOnCompletion(value, self.event).is_err() {
+                return false;
+            }
+            WaitForSingleObject(self.event, GPU_WAIT_TIMEOUT_MS) == WAIT_OBJECT_0
+        }
+    }
+}
+
+impl Drop for GpuFence {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.event);
+        }
+    }
 }
 
 impl Drop for GraphicsD3D11 {
@@ -332,6 +397,11 @@ impl GraphicsD3D11 {
             ComPtr::from_raw(srv)
         };
 
+        let gpu_fence = GpuFence::new(device.as_ptr(), context);
+        if gpu_fence.is_none() {
+            warn!("D3D11 fences unavailable");
+        }
+
         let mut result = GraphicsD3D11 {
             device,
             info_queue: if info_queue.is_null() {
@@ -340,6 +410,7 @@ impl GraphicsD3D11 {
                 Some(ComPtr::from_raw(info_queue))
             },
             context: ComPtr::from_raw(context),
+            dxgi_factory,
             swapchain,
             backbuffer: None,
             blit_vs: ComPtr::from_raw(blit_vs),
@@ -351,6 +422,7 @@ impl GraphicsD3D11 {
             dummy_srv_3d,
             swap_chain_waitable,
             frame_statistics: std::mem::zeroed(),
+            gpu_fence,
         };
 
         result.update_backbuffer(hwnd);
@@ -436,6 +508,77 @@ impl GraphicsD3D11 {
                 .GetFrameStatistics(&mut self.frame_statistics);
         }
     }
+
+    pub fn wait_for_gpu(&self) -> bool {
+        self.gpu_fence.as_ref().is_some_and(|fence| fence.wait())
+    }
+
+    pub fn create_swap_chain(
+        &self,
+        hwnd: HWND,
+        dim: (u32, u32),
+    ) -> Option<(ComPtr<IDXGISwapChain1>, ComPtr<ID3D11RenderTargetView>)> {
+        let desc = DXGI_SWAP_CHAIN_DESC1 {
+            Width: dim.0,
+            Height: dim.1,
+            Format: BACK_BUFFER_FORMAT,
+            Stereo: 0,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: 2,
+            Scaling: DXGI_SCALING_NONE,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+            AlphaMode: DXGI_ALPHA_MODE_UNSPECIFIED,
+            Flags: 0,
+        };
+        unsafe {
+            let swapchain = ComPtr::new(|| {
+                let mut obj = null_mut();
+                let hr = self.dxgi_factory.CreateSwapChainForHwnd(
+                    self.device.as_ptr() as _,
+                    hwnd,
+                    &desc,
+                    null_mut(),
+                    null_mut(),
+                    &mut obj,
+                );
+                hresult(obj, hr)
+            })
+            .ok()?;
+            let tex = ComPtr::new(|| {
+                let mut obj: *mut ID3D11Texture2D = null_mut();
+                let hr = swapchain.GetBuffer(0, &ID3D11Texture2D::uuidof(), &mut obj as *mut _ as _);
+                hresult(obj, hr)
+            })
+            .ok()?;
+            let rtv = ComPtr::new(|| {
+                let mut obj = null_mut();
+                let hr = self
+                    .device
+                    .CreateRenderTargetView(tex.as_ptr() as _, null_mut(), &mut obj);
+                hresult(obj, hr)
+            })
+            .ok()?;
+            Some((swapchain, rtv))
+        }
+    }
+}
+
+pub fn last_present_count(swapchain: &ComPtr<IDXGISwapChain1>) -> u32 {
+    let mut count = 0;
+    unsafe {
+        swapchain.GetLastPresentCount(&mut count);
+    }
+    count
+}
+
+pub fn displayed_present_count(swapchain: &ComPtr<IDXGISwapChain1>) -> Option<u32> {
+    let mut stats: DXGI_FRAME_STATISTICS = unsafe { std::mem::zeroed() };
+    let hr = unsafe { swapchain.GetFrameStatistics(&mut stats) };
+    (hr == S_OK).then_some(stats.PresentCount)
 }
 
 pub struct DdsTextureData {

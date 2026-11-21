@@ -4,12 +4,13 @@ struct Constants {
 	float2 mouse_pos;
 	uint mouse_buttons;
 	uint show_transparency;
-	float4 xfm_viewport_to_image_uv; // xy: scale, zw: offset
+	float4 xfm_content_to_image_uv; // xy: scale, zw: offset
 	uint image_type; // 0 = 2d/2darray, 1 = 3d
 	uint current_slice;
 	uint current_mip;
 	uint slice_count;
 	uint premultiplied_alpha;
+	int2 content_offset;
 };
 
 struct VSOut {
@@ -35,18 +36,18 @@ VSOut blit_vs(uint i: SV_VERTEXID) {
 	return v[i];
 }
 
-float4 background_color(uint2 pixel_pos) {
-	pixel_pos /= 8;
+float4 background_color(int2 content_pixel) {
+	int2 cell = content_pixel >> 3;
 	float c = 0.08;
-	return ((pixel_pos.x + pixel_pos.y) & 1)
+	return ((cell.x + cell.y) & 1)
 	? float4((float3)0.65 + c, 1.0)
 	: float4((float3)0.65 - c, 1.0);
 }
 
-float2 viewport_to_image_uv(float2 viewport_pos) {
-	float2 scale  = g_constants.xfm_viewport_to_image_uv.xy;
-	float2 offset = g_constants.xfm_viewport_to_image_uv.zw;
-	return viewport_pos * scale + offset;
+float2 content_to_image_uv(float2 content_pos) {
+	float2 scale  = g_constants.xfm_content_to_image_uv.xy;
+	float2 offset = g_constants.xfm_content_to_image_uv.zw;
+	return content_pos * scale + offset;
 }
 
 float4 sample_image(float2 uv) {
@@ -58,8 +59,8 @@ float4 sample_image(float2 uv) {
 }
 
 float4 blit_ps(VSOut v) : SV_TARGET {
-	float2 uv = viewport_to_image_uv(v.pos.xy);
-	float4 bg = background_color((uint2)(v.pos.xy));
+	float2 uv = content_to_image_uv(v.pos.xy + (float2)g_constants.content_offset);
+	float4 bg = background_color((int2)v.pos.xy + g_constants.content_offset);
 	if (any(abs(uv-0.5) > 0.5) || g_constants.image_dim.x == 0) {
 		return bg;
 	}

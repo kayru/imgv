@@ -5,6 +5,7 @@
 use cgmath::{assert_ulps_eq, prelude::*};
 use com_ptr::{hresult, ComPtr};
 use log::{debug, error, info, warn};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::ptr::null_mut;
@@ -52,6 +53,9 @@ use window::*;
 mod loader;
 use loader::{load_image_with_metadata, ImageData};
 
+mod placeholder;
+use placeholder::{wait_for_composition, Placeholder, ScreenRect};
+
 mod browse;
 use browse::{get_next_file, StepDirection};
 
@@ -86,10 +90,26 @@ struct Window {
     message_rx: std::sync::mpsc::Receiver<WindowMessages>,
     hwnd: HWND,
     window_style: u32,
-    window_rect: RECT,
+    client_rect: RECT,
+    content_anchor: (i32, i32),
     windowed_client_rect: RECT,
     window_dim: (i32, i32),
     full_screen: bool,
+}
+
+struct ImageWindowPlan {
+    client_rect: RECT,
+    normal_window_rect: Option<RECT>,
+}
+
+fn rect_tuple(r: &RECT) -> (i32, i32, i32, i32) {
+    (r.left, r.top, r.right, r.bottom)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContentAnchor {
+    FollowWindowMove,
+    FixedOnScreen,
 }
 
 struct WindowThreadState {
@@ -197,7 +217,7 @@ impl Window {
                 unsafe {
                     SetProcessDpiAwareness(1);
 
-                    let window_name = to_wide_string("imgv");
+                    let window_name = to_wide_string(concat!("imgv ", env!("CARGO_PKG_VERSION")));
                     let icon_name = to_wide_string("imgv");
                     let window_class_name = to_wide_string("imgv_window_class");
 
@@ -270,12 +290,14 @@ impl Window {
             .unwrap();
 
         if let WindowMessages::WindowCreated(data) = channel_receiver.recv().unwrap() {
+            let client_rect = get_client_rect(data.hwnd);
             return Ok(Window {
                 message_rx: channel_receiver,
                 hwnd: data.hwnd,
                 window_style,
-                window_rect: get_window_rect_absolute(data.hwnd),
-                windowed_client_rect: get_client_rect(data.hwnd),
+                client_rect,
+                content_anchor: (client_rect.left, client_rect.top),
+                windowed_client_rect: client_rect,
                 window_dim,
                 full_screen: false,
             });
@@ -290,70 +312,169 @@ impl Window {
         }
     }
 
-    pub fn set_image_size(&mut self, dim: (i32, i32)) {
+    pub fn plan_image_size(&self, dim: (i32, i32)) -> ImageWindowPlan {
+        let work = get_monitor_work_rect(self.hwnd);
+        let mut frame = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        unsafe {
+            AdjustWindowRect(&mut frame, self.window_style, 0);
+        }
+
+        let window_w = (dim.0 + frame.right - frame.left).max(WINDOW_MIN_WIDTH);
+        let window_h = (dim.1 + frame.bottom - frame.top).max(WINDOW_MIN_HEIGHT);
+        let (work_w, work_h) = work.dim();
+
+        if window_w <= work_w && window_h <= work_h {
+            let left = work.left + (work_w - window_w) / 2;
+            let top = work.top + (work_h - window_h) / 2;
+            let window_rect = RECT {
+                left,
+                top,
+                right: left + window_w,
+                bottom: top + window_h,
+            };
+            ImageWindowPlan {
+                client_rect: RECT {
+                    left: window_rect.left - frame.left,
+                    top: window_rect.top - frame.top,
+                    right: window_rect.right - frame.right,
+                    bottom: window_rect.bottom - frame.bottom,
+                },
+                normal_window_rect: Some(window_rect),
+            }
+        } else {
+            ImageWindowPlan {
+                client_rect: RECT {
+                    left: work.left,
+                    top: work.top - frame.top - frame.bottom,
+                    right: work.right,
+                    bottom: work.bottom,
+                },
+                normal_window_rect: None,
+            }
+        }
+    }
+
+    pub fn set_image_size(&mut self, plan: &ImageWindowPlan) {
         if self.full_screen {
             self.set_full_screen(false);
         }
-        let mut rect = compute_client_rect(dim);
+
         unsafe {
-            let desktop_rect = get_desktop_work_area().dim();
-            AdjustWindowRect(&mut rect, self.window_style, 0);
-            if dim.0 < desktop_rect.0 && dim.1 < desktop_rect.1 {
-                let placement = WINDOWPLACEMENT {
-                    length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
-                    flags: 0,
-                    showCmd: SW_RESTORE as u32,
-                    ptMinPosition: POINT { x: 0, y: 0 },
-                    ptMaxPosition: POINT { x: 0, y: 0 },
-                    rcNormalPosition: RECT {
-                        left: 0,
-                        top: 0,
-                        right: 0,
-                        bottom: 0,
-                    },
-                };
-                //ShowWindow(self.hwnd, SW_RESTORE);
-                SetWindowPlacement(self.hwnd, &placement);
-                SetWindowPos(
-                    self.hwnd,
-                    null_mut(),
-                    rect.left,
-                    rect.top,
-                    rect.right - rect.left,
-                    rect.bottom - rect.top,
-                    0,
-                );
-                self.window_dim = dim;
-                self.window_rect = get_window_rect_absolute(self.hwnd);
-            } else {
-                //ShowWindow(self.hwnd, SW_MAXIMIZE);
-                let placement = WINDOWPLACEMENT {
-                    length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
-                    flags: 0,
-                    showCmd: SW_MAXIMIZE as u32,
-                    ptMinPosition: POINT { x: 0, y: 0 },
-                    ptMaxPosition: POINT { x: 0, y: 0 },
-                    rcNormalPosition: RECT {
-                        left: 0,
-                        top: 0,
-                        right: 0,
-                        bottom: 0,
-                    },
-                };
-                SetWindowPlacement(self.hwnd, &placement);
+            let mut placement: WINDOWPLACEMENT = std::mem::zeroed();
+            placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+            GetWindowPlacement(self.hwnd, &mut placement);
+            let maximized = IsZoomed(self.hwnd) != 0;
+
+            match plan.normal_window_rect {
+                Some(rect) if maximized => {
+                    placement.flags = 0;
+                    placement.showCmd = SW_SHOWNORMAL as u32;
+                    placement.rcNormalPosition = screen_to_workspace(self.hwnd, rect);
+                    SetWindowPlacement(self.hwnd, &placement);
+                }
+                Some(rect) => {
+                    let (w, h) = rect.dim();
+                    SetWindowPos(
+                        self.hwnd,
+                        null_mut(),
+                        rect.left,
+                        rect.top,
+                        w,
+                        h,
+                        0,
+                    );
+                }
+                None if !maximized => {
+                    placement.flags = 0;
+                    placement.showCmd = SW_MAXIMIZE as u32;
+                    SetWindowPlacement(self.hwnd, &placement);
+                }
+                None => {}
             }
         }
+
+        self.sync_client_rect(ContentAnchor::FixedOnScreen);
+        if !rects_equal(&self.client_rect, &plan.client_rect) {
+            debug!(
+                "Client rect {:?} differs from planned {:?}",
+                rect_tuple(&self.client_rect),
+                rect_tuple(&plan.client_rect)
+            );
+        }
+    }
+
+    pub fn sync_client_rect(&mut self, anchor: ContentAnchor) {
+        if unsafe { IsIconic(self.hwnd) } != 0 {
+            return;
+        }
+
+        let new_rect = get_client_rect(self.hwnd);
+        let moved_only = new_rect.dim() == self.client_rect.dim();
+        if anchor == ContentAnchor::FollowWindowMove && moved_only {
+            self.content_anchor.0 += new_rect.left - self.client_rect.left;
+            self.content_anchor.1 += new_rect.top - self.client_rect.top;
+        }
+
+        self.client_rect = new_rect;
+        self.window_dim = new_rect.dim();
+    }
+
+    pub fn content_offset(&self) -> [i32; 2] {
+        self.content_offset_at(&self.client_rect)
+    }
+
+    pub fn content_offset_at(&self, client_rect: &RECT) -> [i32; 2] {
+        [
+            client_rect.left - self.content_anchor.0,
+            client_rect.top - self.content_anchor.1,
+        ]
+    }
+
+    pub fn center_content_at(&self, client_rect: &RECT) -> float2 {
+        let offset = self.content_offset_at(client_rect);
+        let (w, h) = client_rect.dim();
+        float2::new(
+            offset[0] as f32 + 0.5 * w as f32,
+            offset[1] as f32 + 0.5 * h as f32,
+        )
+    }
+
+    pub fn center_content(&self) -> float2 {
+        self.center_content_at(&self.client_rect)
+    }
+
+    pub fn client_rect_for_full_screen(&self, full_screen: bool) -> RECT {
+        if full_screen {
+            get_monitor_rect(self.hwnd)
+        } else {
+            self.windowed_client_rect
+        }
+    }
+
+    pub fn content_offset_f(&self) -> float2 {
+        let offset = self.content_offset();
+        float2::new(offset[0] as f32, offset[1] as f32)
+    }
+
+    pub fn client_dim(&self) -> float2 {
+        let dim = self.client_rect.dim();
+        float2::new(dim.0 as f32, dim.1 as f32)
     }
 
     pub fn set_full_screen(&mut self, state: bool) {
         if state {
             self.windowed_client_rect = get_client_rect(self.hwnd);
-            let (w, h) = get_screen_dimensions();
+            let monitor = get_monitor_rect(self.hwnd);
+            let (w, h) = monitor.dim();
             unsafe {
                 SetWindowLongPtrW(self.hwnd, GWL_STYLE, (WS_VISIBLE | WS_POPUP) as isize);
-                SetWindowPos(self.hwnd, HWND_TOP, 0, 0, w, h, SWP_FRAMECHANGED);
+                SetWindowPos(self.hwnd, HWND_TOP, monitor.left, monitor.top, w, h, SWP_FRAMECHANGED);
             }
-            self.window_dim = (w, h);
             self.full_screen = true;
         } else {
             unsafe {
@@ -366,19 +487,12 @@ impl Window {
                 AdjustWindowRect(&mut rect, self.window_style, 0);
                 let w = rect.right - rect.left;
                 let h = rect.bottom - rect.top;
-                SetWindowPos(
-                    self.hwnd,
-                    null_mut(),
-                    self.windowed_client_rect.left,
-                    self.windowed_client_rect.top,
-                    w,
-                    h,
-                    SWP_FRAMECHANGED,
-                );
-                self.window_dim = (w, h);
+                SetWindowPos(self.hwnd, null_mut(), rect.left, rect.top, w, h, SWP_FRAMECHANGED);
             }
             self.full_screen = false;
         }
+
+        self.sync_client_rect(ContentAnchor::FixedOnScreen);
     }
 
     pub fn screenshot(&self) {
@@ -424,13 +538,31 @@ struct ViewerState {
     is_dragging: bool,
     drag_origin: float2,
     mouse_pos: float2,
-    viewport_dim: float2,
-    image_dim: float2,
     show_transparency: bool,
     dds_data: Option<DdsTextureData>,
     dds_slice: u32,
     dds_mip: u32,
-    xfm_window_to_image: Transform2D,
+    xfm_content_to_image: Transform2D,
+    shown_image: Option<PathBuf>,
+    saved_views: HashMap<PathBuf, ImageView>,
+}
+
+#[derive(Clone, Copy)]
+struct ImageView {
+    xfm_content_to_image: Transform2D,
+    window_center: float2,
+}
+
+const DEFAULT_VIEW_TOLERANCE: f32 = 1e-3;
+
+impl ImageView {
+    fn is_default(&self, image_dim: float2) -> bool {
+        let xfm = &self.xfm_content_to_image;
+        let center = xfm.transform_point(self.window_center);
+        let max_diff = |a: float2, b: float2| (a.x - b.x).abs().max((a.y - b.y).abs());
+        max_diff(xfm.scale, FLOAT2_ONE) <= DEFAULT_VIEW_TOLERANCE
+            && max_diff(center, 0.5 * image_dim) <= DEFAULT_VIEW_TOLERANCE
+    }
 }
 
 impl ViewerState {
@@ -442,44 +574,288 @@ impl ViewerState {
             is_dragging: false,
             drag_origin: FLOAT2_ZERO,
             mouse_pos: FLOAT2_ZERO,
-            viewport_dim: FLOAT2_ZERO,
-            image_dim: FLOAT2_ZERO,
             show_transparency: false,
             dds_data: None,
             dds_slice: 0,
             dds_mip: 0,
-            xfm_window_to_image: Transform2D::new_identity(),
+            xfm_content_to_image: Transform2D::new_identity(),
+            shown_image: None,
+            saved_views: HashMap::new(),
         }
     }
 
-    fn reset_image_transform(&mut self) {
-        self.xfm_window_to_image = Transform2D::new_identity();
-        self.xfm_window_to_image.offset = 0.5 * self.image_dim - 0.5 * self.viewport_dim;
+    fn center_image(&mut self, scale: float2, image_dim: float2, window_center: float2) {
+        self.xfm_content_to_image = Transform2D {
+            scale,
+            offset: 0.5 * image_dim - window_center.mul_element_wise(scale),
+        };
     }
+
+    fn view(&self, window: &Window) -> ImageView {
+        ImageView {
+            xfm_content_to_image: self.xfm_content_to_image,
+            window_center: window.center_content(),
+        }
+    }
+
+    fn set_view(&mut self, view: ImageView, window_center: float2) {
+        let mut xfm = view.xfm_content_to_image;
+        let shift = view.window_center - window_center;
+        if shift != FLOAT2_ZERO {
+            xfm.offset += shift.mul_element_wise(xfm.scale);
+        }
+        self.xfm_content_to_image = xfm;
+    }
+
+    fn save_shown_image_view(&mut self, window: &Window, image_dim: float2) {
+        let Some(path) = self.shown_image.take() else {
+            return;
+        };
+
+        let view = self.view(window);
+        if view.is_default(image_dim) {
+            self.saved_views.remove(&path);
+        } else {
+            self.saved_views.insert(path, view);
+        }
+    }
+
+    fn mouse_pos_content(&self, window: &Window) -> float2 {
+        self.mouse_pos + window.content_offset_f()
+    }
+}
+
+fn update_view_constants(
+    constants: &mut Constants,
+    state: &ViewerState,
+    client_dim: (i32, i32),
+    content_offset: [i32; 2],
+) {
+    constants.window_dim = float2::new(client_dim.0 as f32, client_dim.1 as f32);
+    constants.content_offset = content_offset;
+
+    let xfm = state.xfm_content_to_image;
+    let xfm_quantized = if xfm.scale.x >= 1.0 || xfm.scale.y >= 1.0 {
+        Transform2D {
+            scale: xfm.scale,
+            offset: float2_round(xfm.offset),
+        }
+    } else {
+        xfm
+    };
+    let xfm_image_to_uv = Transform2D {
+        scale: 1.0 / constants.image_dim,
+        offset: FLOAT2_ZERO,
+    };
+    constants.xfm_content_to_image_uv = xfm_quantized.concatenate(xfm_image_to_uv).into();
+}
+
+fn draw_frame(
+    graphics: &GraphicsD3D11,
+    state: &ViewerState,
+    constants: &Constants,
+    rtv: *mut ID3D11RenderTargetView,
+    dim: (u32, u32),
+) {
+    unsafe {
+        let context = &graphics.context;
+
+        context.UpdateSubresource(
+            graphics.constants.as_ptr() as _,
+            0,
+            null_mut(),
+            constants as *const Constants as _,
+            0,
+            0,
+        );
+
+        let rtvs: [*mut ID3D11RenderTargetView; 1] = [rtv];
+        context.OMSetRenderTargets(1, rtvs.as_ptr(), null_mut());
+
+        let viewport = D3D11_VIEWPORT {
+            Width: dim.0 as f32,
+            Height: dim.1 as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+        };
+        context.RSSetViewports(1, &viewport);
+
+        let clear_color: [f32; 4] = [0.1, 0.2, 0.3, 1.0];
+        context.ClearRenderTargetView(rtv, &clear_color);
+
+        let cbvs: [*mut ID3D11Buffer; 1] = [graphics.constants.as_ptr()];
+        let (srv_array, srv_volume) = if let Some(texture) = &state.texture {
+            match texture.image_type {
+                ImageType::Image2DArray => (texture.srv.as_ptr(), graphics.dummy_srv_3d.as_ptr()),
+                ImageType::Volume => (graphics.dummy_srv_2d_array.as_ptr(), texture.srv.as_ptr()),
+            }
+        } else {
+            (graphics.dummy_srv_2d_array.as_ptr(), graphics.dummy_srv_3d.as_ptr())
+        };
+        let srvs: [*mut ID3D11ShaderResourceView; 2] = [srv_array, srv_volume];
+        let samplers: [*mut ID3D11SamplerState; 3] = [
+            graphics.smp_linear.as_ptr(), // g_default_sampler
+            graphics.smp_linear.as_ptr(), // g_linear_sampler
+            graphics.smp_point.as_ptr(),  // g_point_sampler
+        ];
+
+        context.PSSetConstantBuffers(0, cbvs.len() as u32, cbvs.as_ptr());
+        context.VSSetConstantBuffers(0, cbvs.len() as u32, cbvs.as_ptr());
+
+        context.VSSetShader(graphics.blit_vs.as_ptr(), null_mut(), 0);
+        context.PSSetShader(graphics.blit_ps.as_ptr(), null_mut(), 0);
+
+        context.VSSetShaderResources(0, srvs.len() as u32, srvs.as_ptr());
+        context.PSSetShaderResources(0, srvs.len() as u32, srvs.as_ptr());
+        context.PSSetSamplers(0, samplers.len() as u32, samplers.as_ptr());
+
+        context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context.Draw(3, 0);
+
+        context.ClearState();
+    }
+}
+
+fn draw_to_back_buffer(graphics: &GraphicsD3D11, state: &ViewerState, constants: &Constants) {
+    let backbuffer = graphics
+        .backbuffer
+        .as_ref()
+        .expect("Back buffer must be created before rendering a frame");
+    draw_frame(graphics, state, constants, backbuffer.rtv.as_ptr(), backbuffer.dim);
+}
+
+fn show_placeholder(
+    window: &Window,
+    graphics: &GraphicsD3D11,
+    state: &ViewerState,
+    constants: &Constants,
+    client_rect: &RECT,
+) -> Option<Placeholder> {
+    let (w, h) = client_rect.dim();
+    let mut target_constants = constants.clone();
+    update_view_constants(
+        &mut target_constants,
+        state,
+        (w, h),
+        window.content_offset_at(client_rect),
+    );
+
+    let rect = ScreenRect {
+        x: client_rect.left,
+        y: client_rect.top,
+        w,
+        h,
+    };
+    let draw = |rtv, dim| draw_frame(graphics, state, &target_constants, rtv, dim);
+    match Placeholder::show(window.hwnd as _, graphics, &rect, draw) {
+        Ok(placeholder) => Some(placeholder),
+        Err(e) => {
+            warn!("Placeholder failed: {e}");
+            None
+        }
+    }
+}
+
+fn change_window_geometry(
+    window: &mut Window,
+    graphics: &mut GraphicsD3D11,
+    state: &mut ViewerState,
+    constants: &mut Constants,
+    target: &RECT,
+    set_view: impl Fn(&mut ViewerState, float2),
+    change: impl FnOnce(&mut Window),
+) {
+    let minimized = unsafe { IsIconic(window.hwnd) } != 0;
+    let placeholder = if minimized || rects_equal(target, &window.client_rect) {
+        None
+    } else {
+        set_view(state, window.center_content_at(target));
+        show_placeholder(window, graphics, state, constants, target)
+    };
+
+    change(window);
+    set_view(state, window.center_content());
+
+    graphics.update_backbuffer(window.hwnd);
+    update_view_constants(constants, state, window.window_dim, window.content_offset());
+    draw_to_back_buffer(graphics, state, constants);
+    graphics.present(1);
+
+    if placeholder.is_some() {
+        if !graphics.wait_for_gpu() {
+            warn!("Frame timed out on the GPU");
+        }
+
+        wait_for_composition();
+    }
+}
+
+fn toggle_full_screen(
+    window: &mut Window,
+    graphics: &mut GraphicsD3D11,
+    state: &mut ViewerState,
+    constants: &mut Constants,
+) {
+    let full_screen = !window.full_screen;
+    let target = window.client_rect_for_full_screen(full_screen);
+    change_window_geometry(
+        window,
+        graphics,
+        state,
+        constants,
+        &target,
+        |_, _| {},
+        |window| window.set_full_screen(full_screen),
+    );
 }
 
 fn apply_loaded_image(
     state: &mut ViewerState,
     main_window: &mut Window,
+    graphics: &mut GraphicsD3D11,
     constants: &mut Constants,
     texture: Texture,
+    image_path: Option<PathBuf>,
     image_name: Option<&str>,
 ) -> (u32, u32) {
+    state.save_shown_image_view(main_window, constants.image_dim);
+
     let dim = texture.dim;
     state.texture = Some(texture);
 
-    let pending_image_dim: float2 = float2::new(dim.0 as f32, dim.1 as f32);
-    if constants.image_dim != pending_image_dim {
-        constants.image_dim = pending_image_dim;
-        if !main_window.full_screen {
-            main_window.set_image_size((dim.0 as i32, dim.1 as i32));
+    let saved_view = image_path
+        .as_ref()
+        .and_then(|path| state.saved_views.get(path).copied());
+    state.shown_image = image_path;
+
+    let image_dim = float2::new(dim.0 as f32, dim.1 as f32);
+    let dim_changed = constants.image_dim != image_dim;
+    constants.image_dim = image_dim;
+
+    let set_view = |state: &mut ViewerState, window_center: float2| {
+        if let Some(view) = saved_view {
+            state.set_view(view, window_center);
+        } else if dim_changed {
+            state.center_image(FLOAT2_ONE, image_dim, window_center);
         }
-        state.xfm_window_to_image = Transform2D::new_identity();
-        let window_dim = float2::new(
-            main_window.window_dim.0 as f32,
-            main_window.window_dim.1 as f32,
+    };
+
+    if dim_changed && !main_window.full_screen {
+        let plan = main_window.plan_image_size((dim.0 as i32, dim.1 as i32));
+        let target = plan.client_rect;
+        change_window_geometry(
+            main_window,
+            graphics,
+            state,
+            constants,
+            &target,
+            set_view,
+            |window| window.set_image_size(&plan),
         );
-        state.xfm_window_to_image.offset = 0.5 * constants.image_dim - 0.5 * window_dim;
+    } else {
+        set_view(state, main_window.center_content());
     }
 
     if let Some(image_name) = image_name {
@@ -578,6 +954,7 @@ fn main() {
             let load_begin_time = Instant::now();
             info!("Loading image {:?}", x);
             let img = load_image_with_metadata(&x);
+            info!("Time to decode image {} ms", to_milliseconds(load_begin_time.elapsed()));
             let _ = image_tx.send((img, load_begin_time, x));
             unsafe {
                 InvalidateRect(main_window_handle as HWND, null_mut(), 1);
@@ -606,13 +983,14 @@ fn main() {
         mouse_pos: FLOAT2_ZERO,
         mouse_buttons: 0,
         show_transparency: 0,
-        xfm_viewport_to_image_uv: Transform2D::new_identity().into(),
+        xfm_content_to_image_uv: Transform2D::new_identity().into(),
         image_type: 0,
         current_slice: 0,
         current_mip: 0,
         slice_count: 1,
         premultiplied_alpha: 0,
-        _pad: [0; 3],
+        content_offset: [0, 0],
+        _pad: 0,
     };
 
     let switch_to_next_image = |current_image_path: &Path, direction: StepDirection| {
@@ -674,21 +1052,22 @@ fn main() {
                             } else {
                                 float2::new(1.2, 1.2)
                             };
-                            let mouse_pos_img =
-                                state.xfm_window_to_image.transform_point(state.mouse_pos);
+                            let mouse_pos_img = state
+                                .xfm_content_to_image
+                                .transform_point(state.mouse_pos_content(&main_window));
                             let zoom_transform = Transform2D::new_translate(-mouse_pos_img)
                                 .concatenate(Transform2D::new_scale(zoom))
                                 .concatenate(Transform2D::new_translate(mouse_pos_img));
                             state
-                                .xfm_window_to_image
+                                .xfm_content_to_image
                                 .inplace_concatenate(zoom_transform);
                             should_draw = true;
                             state.is_dragging = false;
                         }
                         WM_LBUTTONDOWN => {
                             state.is_dragging = true;
-                            state.drag_origin =
-                                state.mouse_pos - state.xfm_window_to_image.inverse().offset;
+                            state.drag_origin = state.mouse_pos_content(&main_window)
+                                - state.xfm_content_to_image.inverse().offset;
                         }
                         WM_LBUTTONUP => {
                             state.is_dragging = false;
@@ -719,10 +1098,11 @@ fn main() {
                         WM_MOUSEMOVE => {
                             state.mouse_pos = decode_mouse_pos(lparam);
                             constants.mouse_pos = state.mouse_pos;
-                            let drag_delta: float2 = state.drag_origin - state.mouse_pos;
                             if state.is_dragging {
-                                state.xfm_window_to_image.offset =
-                                    drag_delta.mul_element_wise(state.xfm_window_to_image.scale);
+                                let drag_delta =
+                                    state.drag_origin - state.mouse_pos_content(&main_window);
+                                state.xfm_content_to_image.offset =
+                                    drag_delta.mul_element_wise(state.xfm_content_to_image.scale);
                             }
                             should_draw = true;
                         }
@@ -736,13 +1116,11 @@ fn main() {
                                     should_exit = true;
                                 }
                                 (VK_HOME, _) => {
-                                    state.xfm_window_to_image = Transform2D::new_identity();
-                                    let window_dim = float2::new(
-                                        main_window.window_dim.0 as f32,
-                                        main_window.window_dim.1 as f32,
+                                    state.center_image(
+                                        FLOAT2_ONE,
+                                        constants.image_dim,
+                                        main_window.center_content(),
                                     );
-                                    state.xfm_window_to_image.offset =
-                                        0.5 * constants.image_dim - 0.5 * window_dim;
                                 }
                                 (VK_LEFT, _) if image_path.is_some() => {
                                     image_path = switch_to_next_image(
@@ -757,7 +1135,12 @@ fn main() {
                                     );
                                 }
                                 (VK_RETURN, _) => {
-                                    main_window.set_full_screen(!main_window.full_screen);
+                                    toggle_full_screen(
+                                        &mut main_window,
+                                        &mut graphics,
+                                        &mut state,
+                                        &mut constants,
+                                    );
                                 }
                                 (_, '1') | (_, '2') | (_, '3') | (_, '4') | (_, '5') => {
                                     let s = match wparam as u8 as char {
@@ -768,11 +1151,11 @@ fn main() {
                                         '5' => 1.0 / 16.0,
                                         _ => unreachable!(),
                                     };
-                                    let scale = float2::new(s, s);
-                                    state.xfm_window_to_image.scale = scale;
-                                    state.xfm_window_to_image.offset =
-                                        0.5 * constants.image_dim
-                                        - 0.5 * state.viewport_dim.mul_element_wise(scale);
+                                    state.center_image(
+                                        float2::new(s, s),
+                                        constants.image_dim,
+                                        main_window.center_content(),
+                                    );
                                 }
                                 (_, 'V') if ctrl_down => {
                                     if let Ok(Some(path)) = get_clipboard_file_path() {
@@ -792,8 +1175,10 @@ fn main() {
                                             let dim = apply_loaded_image(
                                                 &mut state,
                                                 &mut main_window,
+                                                &mut graphics,
                                                 &mut constants,
                                                 texture,
+                                                None,
                                                 Some("Clipboard Image"),
                                             );
                                             info!(
@@ -861,21 +1246,8 @@ fn main() {
                             }
                             should_draw = true;
                         }
-                        WM_SIZE => {
-                            let width = winapi::shared::minwindef::LOWORD(lparam as u32) as i32;
-                            let height = winapi::shared::minwindef::HIWORD(lparam as u32) as i32;
-                            state.viewport_dim = float2::new(width as f32, height as f32);
-                            main_window.window_dim = (width, height);
-                            let new_window_rect = get_window_rect_absolute(main_window.hwnd);
-                            let edge_delta = float2::new(
-                                (new_window_rect.left - main_window.window_rect.left) as f32,
-                                (new_window_rect.top - main_window.window_rect.top) as f32,
-                            );
-                            if edge_delta != FLOAT2_ZERO {
-                                state.xfm_window_to_image.offset +=
-                                    edge_delta.mul_element_wise(state.xfm_window_to_image.scale);
-                            }
-                            main_window.window_rect = new_window_rect;
+                        WM_SIZE | WM_MOVE => {
+                            main_window.sync_client_rect(ContentAnchor::FollowWindowMove);
                             graphics.update_backbuffer(main_window.hwnd);
                             should_draw = true;
                         }
@@ -906,29 +1278,6 @@ fn main() {
         if !should_draw || !should_block {
             continue;
         }
-
-        let xfm_viewport_to_image_uv = Transform2D {
-            scale: 1.0 / constants.image_dim,
-            offset: FLOAT2_ZERO,
-        };
-
-        constants.window_dim.x = main_window.window_dim.0 as f32;
-        constants.window_dim.y = main_window.window_dim.1 as f32;
-
-        let xfm_window_to_image_quantized = if state.xfm_window_to_image.scale.x >= 1.0
-            || state.xfm_window_to_image.scale.y >= 1.0
-        {
-            Transform2D {
-                scale: state.xfm_window_to_image.scale,
-                offset: float2_round(state.xfm_window_to_image.offset),
-            }
-        } else {
-            state.xfm_window_to_image
-        };
-
-        constants.xfm_viewport_to_image_uv = xfm_window_to_image_quantized
-            .concatenate(xfm_viewport_to_image_uv)
-            .into();
 
         if let Ok((img, load_begin_time, image_filename)) = image_rx.try_recv() {
             if let Ok(img) = img {
@@ -967,11 +1316,15 @@ fn main() {
                     error!("Failed to create texture for {:?}", image_filename);
                     continue;
                 };
+                let image_key =
+                    std::fs::canonicalize(&image_filename).unwrap_or(image_filename.clone());
                 let dim = apply_loaded_image(
                     &mut state,
                     &mut main_window,
+                    &mut graphics,
                     &mut constants,
                     texture,
+                    Some(image_key),
                     Some(&image_name),
                 );
 
@@ -1042,7 +1395,7 @@ fn main() {
             info!("Init time: {:.2}ms", to_milliseconds(init_time));
         }
 
-        unsafe {
+        {
             profiling::scope!("Draw");
 
             if verbose_log {
@@ -1060,68 +1413,13 @@ fn main() {
 
             draw_begin_time = Instant::now();
 
-            let context = &graphics.context;
-
-            context.UpdateSubresource(
-                graphics.constants.as_ptr() as _,
-                0,
-                null_mut(),
-                &constants as *const Constants as _,
-                0,
-                0,
+            update_view_constants(
+                &mut constants,
+                &state,
+                main_window.window_dim,
+                main_window.content_offset(),
             );
-
-            let backbuffer = graphics
-                .backbuffer
-                .as_ref()
-                .expect("Back buffer must be created before rendering a frame");
-
-            let rtvs: [*mut ID3D11RenderTargetView; 1] = [backbuffer.rtv.as_ptr()];
-            context.OMSetRenderTargets(1, rtvs.as_ptr(), null_mut());
-
-            let viewport = D3D11_VIEWPORT {
-                Width: backbuffer.dim.0 as f32,
-                Height: backbuffer.dim.1 as f32,
-                MinDepth: 0.0,
-                MaxDepth: 1.0,
-                TopLeftX: 0.0,
-                TopLeftY: 0.0,
-            };
-            context.RSSetViewports(1, &viewport);
-
-            let clear_color: [f32; 4] = [0.1, 0.2, 0.3, 1.0];
-            context.ClearRenderTargetView(backbuffer.rtv.as_ptr(), &clear_color);
-
-            let cbvs: [*mut ID3D11Buffer; 1] = [graphics.constants.as_ptr()];
-            let (srv_array, srv_volume) = if let Some(texture) = &state.texture {
-                match texture.image_type {
-                    ImageType::Image2DArray => (texture.srv.as_ptr(), graphics.dummy_srv_3d.as_ptr()),
-                    ImageType::Volume => (graphics.dummy_srv_2d_array.as_ptr(), texture.srv.as_ptr()),
-                }
-            } else {
-                (graphics.dummy_srv_2d_array.as_ptr(), graphics.dummy_srv_3d.as_ptr())
-            };
-            let srvs: [*mut ID3D11ShaderResourceView; 2] = [srv_array, srv_volume];
-            let samplers: [*mut ID3D11SamplerState; 3] = [
-                graphics.smp_linear.as_ptr(), // g_default_sampler
-                graphics.smp_linear.as_ptr(), // g_linear_sampler
-                graphics.smp_point.as_ptr(),  // g_point_sampler
-            ];
-
-            context.PSSetConstantBuffers(0, cbvs.len() as u32, cbvs.as_ptr());
-            context.VSSetConstantBuffers(0, cbvs.len() as u32, cbvs.as_ptr());
-
-            context.VSSetShader(graphics.blit_vs.as_ptr(), null_mut(), 0);
-            context.PSSetShader(graphics.blit_ps.as_ptr(), null_mut(), 0);
-
-            context.VSSetShaderResources(0, srvs.len() as u32, srvs.as_ptr());
-            context.PSSetShaderResources(0, srvs.len() as u32, srvs.as_ptr());
-            context.PSSetSamplers(0, samplers.len() as u32, samplers.as_ptr());
-
-            context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            context.Draw(3, 0);
-
-            context.ClearState();
+            draw_to_back_buffer(&graphics, &state, &constants);
 
             let present_interval = if state.is_dragging { 0 } else { 1 };
             graphics.present(present_interval);
