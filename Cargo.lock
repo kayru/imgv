@@ -741,6 +741,7 @@ dependencies = [
  "widestring",
  "winapi",
  "windows",
+ "windows-numerics",
  "winres",
 ]
 

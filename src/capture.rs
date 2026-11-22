@@ -101,7 +101,7 @@ fn calc_capture_area(
     })
 }
 
-pub fn capture_window(hwnd: isize) -> Result<image::RgbaImage> {
+pub fn capture_window(hwnd: isize, caption_height: i32) -> Result<image::RgbaImage> {
     let mut mapped_point: [POINT; 1] = [POINT::default()];
     unsafe {
         MapWindowPoints(
@@ -112,7 +112,7 @@ pub fn capture_window(hwnd: isize) -> Result<image::RgbaImage> {
     }
 
     let region_x = mapped_point[0].x;
-    let region_y = mapped_point[0].y;
+    let region_y = mapped_point[0].y + caption_height;
 
     let display_info =
         DisplayInfo::from_point(region_x, region_y).expect("Failed to look up display info");
@@ -124,7 +124,7 @@ pub fn capture_window(hwnd: isize) -> Result<image::RgbaImage> {
         region_x,
         region_y,
         client_rect.right,
-        client_rect.bottom,
+        client_rect.bottom - caption_height,
         &display_info,
     )
     .expect("Failed to calculate capture area");
@@ -248,8 +248,8 @@ pub fn capture_window(hwnd: isize) -> Result<image::RgbaImage> {
         .ok_or(anyhow!("Image buffer is not large enough"))
 }
 
-pub fn save_to_clipboard(hwnd: isize) -> Result<()> {
-    let image = capture_window(hwnd).expect("Failed to capture window image");
+pub fn save_to_clipboard(hwnd: isize, caption_height: i32) -> Result<()> {
+    let image = capture_window(hwnd, caption_height).expect("Failed to capture window image");
 
     let dyn_image: image::DynamicImage = image.into();
     let dyn_image = dyn_image.flipv();

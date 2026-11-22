@@ -6,6 +6,7 @@ use cgmath::{assert_ulps_eq, prelude::*};
 use com_ptr::{hresult, ComPtr};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::ptr::null_mut;
@@ -53,8 +54,11 @@ use window::*;
 mod loader;
 use loader::{load_image_with_metadata, ImageData};
 
+mod caption;
+use caption::{Caption, CaptionButton, CaptionRenderer, CaptionState};
+
 mod placeholder;
-use placeholder::{wait_for_composition, Placeholder, ScreenRect};
+use placeholder::{set_transitions_disabled, wait_for_composition, Placeholder, ScreenRect};
 
 mod browse;
 use browse::{get_next_file, StepDirection};
@@ -95,10 +99,19 @@ struct Window {
     windowed_client_rect: RECT,
     window_dim: (i32, i32),
     full_screen: bool,
+    caption: Arc<CaptionState>,
+    title: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowPlacement {
+    Centered,
+    KeepCenter,
 }
 
 struct ImageWindowPlan {
     client_rect: RECT,
+    caption_height: i32,
     normal_window_rect: Option<RECT>,
 }
 
@@ -115,6 +128,94 @@ enum ContentAnchor {
 struct WindowThreadState {
     message_tx: std::sync::mpsc::Sender<WindowMessages>,
     is_window_closed: bool,
+    caption: Arc<CaptionState>,
+}
+
+fn caption_syscommand(button: CaptionButton, hwnd: HWND) -> Option<usize> {
+    match button {
+        CaptionButton::Minimize => Some(SC_MINIMIZE),
+        CaptionButton::Maximize if unsafe { IsZoomed(hwnd) } != 0 => Some(SC_RESTORE),
+        CaptionButton::Maximize => Some(SC_MAXIMIZE),
+        CaptionButton::Close => Some(SC_CLOSE),
+        CaptionButton::None => None,
+    }
+}
+
+unsafe fn handle_caption_message(
+    hwnd: HWND,
+    msg: UINT,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    caption: &CaptionState,
+) -> Option<LRESULT> {
+    let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+    if !caption::has_caption(style) {
+        return None;
+    }
+
+    let redraw = |changed: bool| {
+        if changed {
+            InvalidateRect(hwnd, null_mut(), 0);
+        }
+    };
+
+    match msg {
+        WM_NCHITTEST => {
+            let hit = DefWindowProcW(hwnd, msg, wparam, lparam);
+            if hit != HTCLIENT {
+                return Some(hit);
+            }
+            Some(caption::hit_test_client(hwnd, style, lparam))
+        }
+        WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK => {
+            let button = CaptionButton::from_hit(wparam as isize);
+            if button == CaptionButton::None {
+                return None;
+            }
+            redraw(caption.set_pressed(button));
+            Some(0)
+        }
+        WM_NCLBUTTONUP => {
+            let button = CaptionButton::from_hit(wparam as isize);
+            if button == CaptionButton::None {
+                redraw(caption.set_pressed(CaptionButton::None));
+                return None;
+            }
+            if caption.pressed() == button {
+                if let Some(command) = caption_syscommand(button, hwnd) {
+                    PostMessageW(hwnd, WM_SYSCOMMAND, command, 0);
+                }
+            }
+            redraw(caption.set_pressed(CaptionButton::None));
+            Some(0)
+        }
+        WM_NCMOUSEMOVE => {
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE | TME_NONCLIENT,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            TrackMouseEvent(&mut track);
+            redraw(caption.set_hovered(CaptionButton::from_hit(wparam as isize)));
+            None
+        }
+        WM_NCMOUSELEAVE => {
+            let hovered = caption.set_hovered(CaptionButton::None);
+            let pressed = caption.set_pressed(CaptionButton::None);
+            redraw(hovered || pressed);
+            None
+        }
+        WM_MOUSEMOVE => {
+            redraw(caption.set_hovered(CaptionButton::None));
+            None
+        }
+        WM_NCACTIVATE => {
+            redraw(caption.set_active(wparam != 0));
+            Some(DefWindowProcW(hwnd, msg, wparam, -1))
+        }
+        _ => None,
+    }
 }
 
 unsafe extern "system" fn window_proc(
@@ -125,6 +226,25 @@ unsafe extern "system" fn window_proc(
 ) -> LRESULT {
     let window_state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowThreadState;
     let window_state = window_state_ptr.as_mut();
+
+    if msg == WM_NCCALCSIZE && wparam != 0 {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        if caption::has_caption(style) {
+            let params = &mut *(lparam as *mut NCCALCSIZE_PARAMS);
+            let maximized = IsZoomed(hwnd) != 0;
+            params.rgrc[0] =
+                caption::window_to_client(params.rgrc[0], &caption::frame_insets(style), maximized);
+            return 0;
+        }
+    }
+
+    if let Some(window_state) = window_state.as_ref() {
+        if let Some(result) =
+            handle_caption_message(hwnd, msg, wparam, lparam, &window_state.caption)
+        {
+            return result;
+        }
+    }
 
     match msg {
         WM_CREATE => {
@@ -202,6 +322,8 @@ unsafe extern "system" fn window_proc(
 impl Window {
     fn new(window_dim: (i32, i32)) -> Result<Window, ()> {
         let (channel_sender, channel_receiver) = std::sync::mpsc::channel();
+        let caption = Arc::new(CaptionState::new());
+        let thread_caption = caption.clone();
 
         let window_style: u32 =
             WS_MAXIMIZEBOX | WS_MINIMIZEBOX | WS_SYSMENU | WS_SIZEBOX | WS_CAPTION;
@@ -212,6 +334,7 @@ impl Window {
                 let mut window_state = WindowThreadState {
                     message_tx: channel_sender,
                     is_window_closed: false,
+                    caption: thread_caption,
                 };
 
                 unsafe {
@@ -242,9 +365,10 @@ impl Window {
 
                     assert!(error_code != 0, "failed to register the window class");
 
-                    let mut client_rect = compute_client_rect(window_dim);
-
-                    AdjustWindowRect(&mut client_rect, window_style, 0);
+                    let client_rect = caption::client_to_window(
+                        compute_client_rect(window_dim),
+                        &caption::frame_insets(window_style),
+                    );
 
                     let window_user_data = &mut window_state as *mut WindowThreadState as _;
                     let hwnd = CreateWindowExW(
@@ -300,6 +424,8 @@ impl Window {
                 windowed_client_rect: client_rect,
                 window_dim,
                 full_screen: false,
+                caption,
+                title: concat!("imgv ", env!("CARGO_PKG_VERSION")).to_string(),
             });
         }
 
@@ -307,30 +433,37 @@ impl Window {
     }
 
     pub fn set_window_name(&mut self, name: &str) {
+        self.title = name.to_string();
         unsafe {
             SetWindowTextW(self.hwnd, to_wide_string(name).as_ptr());
         }
     }
 
-    pub fn plan_image_size(&self, dim: (i32, i32)) -> ImageWindowPlan {
+    pub fn plan_image_size(&self, dim: (i32, i32), placement: WindowPlacement) -> ImageWindowPlan {
         let work = get_monitor_work_rect(self.hwnd);
-        let mut frame = RECT {
-            left: 0,
-            top: 0,
-            right: 0,
-            bottom: 0,
-        };
-        unsafe {
-            AdjustWindowRect(&mut frame, self.window_style, 0);
-        }
+        let insets = caption::frame_insets(self.window_style);
 
-        let window_w = (dim.0 + frame.right - frame.left).max(WINDOW_MIN_WIDTH);
-        let window_h = (dim.1 + frame.bottom - frame.top).max(WINDOW_MIN_HEIGHT);
+        let window_w = (dim.0 + insets.left + insets.right).max(WINDOW_MIN_WIDTH);
+        let window_h = (dim.1 + insets.top + insets.bottom).max(WINDOW_MIN_HEIGHT);
         let (work_w, work_h) = work.dim();
 
         if window_w <= work_w && window_h <= work_h {
-            let left = work.left + (work_w - window_w) / 2;
-            let top = work.top + (work_h - window_h) / 2;
+            let maximized = unsafe { IsZoomed(self.hwnd) } != 0;
+            let (left, top) = match placement {
+                WindowPlacement::KeepCenter if !maximized => {
+                    let current = get_window_rect(self.hwnd);
+                    let center_x = (current.left + current.right) / 2;
+                    let center_y = (current.top + current.bottom) / 2;
+                    (
+                        (center_x - window_w / 2).clamp(work.left, work.right - window_w),
+                        (center_y - window_h / 2).clamp(work.top, work.bottom - window_h),
+                    )
+                }
+                _ => (
+                    work.left + (work_w - window_w) / 2,
+                    work.top + (work_h - window_h) / 2,
+                ),
+            };
             let window_rect = RECT {
                 left,
                 top,
@@ -338,25 +471,25 @@ impl Window {
                 bottom: top + window_h,
             };
             ImageWindowPlan {
-                client_rect: RECT {
-                    left: window_rect.left - frame.left,
-                    top: window_rect.top - frame.top,
-                    right: window_rect.right - frame.right,
-                    bottom: window_rect.bottom - frame.bottom,
-                },
+                client_rect: caption::window_to_client(window_rect, &insets, false),
+                caption_height: caption::caption_height(&insets, false),
                 normal_window_rect: Some(window_rect),
             }
         } else {
             ImageWindowPlan {
-                client_rect: RECT {
-                    left: work.left,
-                    top: work.top - frame.top - frame.bottom,
-                    right: work.right,
-                    bottom: work.bottom,
-                },
+                client_rect: work,
+                caption_height: caption::caption_height(&insets, true),
                 normal_window_rect: None,
             }
         }
+    }
+    pub fn set_normal_client_rect(&mut self, client_rect: &RECT) {
+        let rect = caption::client_to_window(*client_rect, &caption::frame_insets(self.window_style));
+        let (w, h) = rect.dim();
+        unsafe {
+            SetWindowPos(self.hwnd, null_mut(), rect.left, rect.top, w, h, 0);
+        }
+        self.sync_client_rect(ContentAnchor::FixedOnScreen);
     }
 
     pub fn set_image_size(&mut self, plan: &ImageWindowPlan) {
@@ -435,24 +568,37 @@ impl Window {
         ]
     }
 
-    pub fn center_content_at(&self, client_rect: &RECT) -> float2 {
+    pub fn caption_height(&self) -> i32 {
+        if self.full_screen {
+            return 0;
+        }
+        let maximized = unsafe { IsZoomed(self.hwnd) } != 0;
+        caption::caption_height(&caption::frame_insets(self.window_style), maximized)
+    }
+
+    pub fn is_maximized(&self) -> bool {
+        unsafe { IsZoomed(self.hwnd) != 0 }
+    }
+
+    pub fn center_content_at(&self, client_rect: &RECT, caption_height: i32) -> float2 {
         let offset = self.content_offset_at(client_rect);
         let (w, h) = client_rect.dim();
         float2::new(
             offset[0] as f32 + 0.5 * w as f32,
-            offset[1] as f32 + 0.5 * h as f32,
+            offset[1] as f32 + caption_height as f32 + 0.5 * (h - caption_height) as f32,
         )
     }
 
     pub fn center_content(&self) -> float2 {
-        self.center_content_at(&self.client_rect)
+        self.center_content_at(&self.client_rect, self.caption_height())
     }
 
-    pub fn client_rect_for_full_screen(&self, full_screen: bool) -> RECT {
+    pub fn client_rect_for_full_screen(&self, full_screen: bool) -> (RECT, i32) {
         if full_screen {
-            get_monitor_rect(self.hwnd)
+            (get_monitor_rect(self.hwnd), 0)
         } else {
-            self.windowed_client_rect
+            let insets = caption::frame_insets(self.window_style);
+            (self.windowed_client_rect, caption::caption_height(&insets, false))
         }
     }
 
@@ -483,8 +629,10 @@ impl Window {
                     GWL_STYLE,
                     (WS_VISIBLE | self.window_style) as isize,
                 );
-                let mut rect = self.windowed_client_rect;
-                AdjustWindowRect(&mut rect, self.window_style, 0);
+                let rect = caption::client_to_window(
+                    self.windowed_client_rect,
+                    &caption::frame_insets(self.window_style),
+                );
                 let w = rect.right - rect.left;
                 let h = rect.bottom - rect.top;
                 SetWindowPos(self.hwnd, null_mut(), rect.left, rect.top, w, h, SWP_FRAMECHANGED);
@@ -496,7 +644,7 @@ impl Window {
     }
 
     pub fn screenshot(&self) {
-        let image = capture_window(self.hwnd as isize).expect("Failed to capture window image");
+        let image = capture_window(self.hwnd as isize, self.caption_height()).expect("Failed to capture window image");
 
         image
             .save("C:\\Temp\\screenshot.png")
@@ -504,7 +652,7 @@ impl Window {
     }
 
     pub fn clipboard_save(&self) {
-        save_to_clipboard(self.hwnd as isize).expect("Failed to capture image to clipboard");
+        save_to_clipboard(self.hwnd as isize, self.caption_height()).expect("Failed to capture image to clipboard");
     }
 }
 
@@ -718,12 +866,67 @@ fn draw_frame(
     }
 }
 
-fn draw_to_back_buffer(graphics: &GraphicsD3D11, state: &ViewerState, constants: &Constants) {
+#[derive(Clone, Copy)]
+struct FrameTarget {
+    client_rect: RECT,
+    caption_height: i32,
+    maximized: bool,
+}
+
+impl FrameTarget {
+    fn current(window: &Window) -> Self {
+        Self {
+            client_rect: window.client_rect,
+            caption_height: window.caption_height(),
+            maximized: window.is_maximized(),
+        }
+    }
+
+    fn normal_state(&self) -> bool {
+        !self.maximized && self.caption_height > 0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlaceholderContent {
+    NextFrame,
+    LastFrame,
+}
+
+fn caption_for<'a>(window: &'a Window, target: &FrameTarget) -> Caption<'a> {
+    Caption {
+        width: target.client_rect.dim().0,
+        height: target.caption_height,
+        title: &window.title,
+        active: window.caption.active(),
+        hovered: window.caption.hovered(),
+        pressed: window.caption.pressed(),
+        maximized: target.maximized,
+    }
+}
+
+fn draw_caption(graphics: &GraphicsD3D11, texture: *mut ID3D11Texture2D, caption: &Caption) {
+    if let Some(renderer) = &graphics.caption {
+        if !unsafe { renderer.draw(texture as _, caption) } {
+            warn!("Caption draw failed");
+        }
+    }
+}
+
+fn draw_to_back_buffer(
+    graphics: &mut GraphicsD3D11,
+    state: &ViewerState,
+    constants: &Constants,
+    window: &Window,
+) {
     let backbuffer = graphics
         .backbuffer
         .as_ref()
         .expect("Back buffer must be created before rendering a frame");
-    draw_frame(graphics, state, constants, backbuffer.rtv.as_ptr(), backbuffer.dim);
+    let (rtv, texture, dim) = (backbuffer.rtv.as_ptr(), backbuffer.tex.as_ptr(), backbuffer.dim);
+    draw_frame(graphics, state, constants, rtv, dim);
+    draw_caption(graphics, texture, &caption_for(window, &FrameTarget::current(window)));
+    graphics.save_last_frame();
 }
 
 fn show_placeholder(
@@ -731,8 +934,10 @@ fn show_placeholder(
     graphics: &GraphicsD3D11,
     state: &ViewerState,
     constants: &Constants,
-    client_rect: &RECT,
+    target: &FrameTarget,
+    content: PlaceholderContent,
 ) -> Option<Placeholder> {
+    let client_rect = &target.client_rect;
     let (w, h) = client_rect.dim();
     let mut target_constants = constants.clone();
     update_view_constants(
@@ -741,6 +946,7 @@ fn show_placeholder(
         (w, h),
         window.content_offset_at(client_rect),
     );
+    let caption = caption_for(window, target);
 
     let rect = ScreenRect {
         x: client_rect.left,
@@ -748,7 +954,17 @@ fn show_placeholder(
         w,
         h,
     };
-    let draw = |rtv, dim| draw_frame(graphics, state, &target_constants, rtv, dim);
+    let draw = |rtv, texture, dim| match content {
+        PlaceholderContent::NextFrame => {
+            draw_frame(graphics, state, &target_constants, rtv, dim);
+            draw_caption(graphics, texture, &caption);
+        }
+        PlaceholderContent::LastFrame => {
+            if !graphics.copy_last_frame(texture, dim) {
+                warn!("Last frame unavailable");
+            }
+        }
+    };
     match Placeholder::show(window.hwnd as _, graphics, &rect, draw) {
         Ok(placeholder) => Some(placeholder),
         Err(e) => {
@@ -758,29 +974,34 @@ fn show_placeholder(
     }
 }
 
-fn change_window_geometry(
+fn rect_contains(outer: &RECT, inner: &RECT) -> bool {
+    outer.left <= inner.left
+        && outer.top <= inner.top
+        && outer.right >= inner.right
+        && outer.bottom >= inner.bottom
+}
+
+fn rect_intersection(a: &RECT, b: &RECT) -> RECT {
+    RECT {
+        left: a.left.max(b.left),
+        top: a.top.max(b.top),
+        right: a.right.min(b.right),
+        bottom: a.bottom.min(b.bottom),
+    }
+}
+
+fn present_window_change(
     window: &mut Window,
     graphics: &mut GraphicsD3D11,
     state: &mut ViewerState,
     constants: &mut Constants,
-    target: &RECT,
-    set_view: impl Fn(&mut ViewerState, float2),
-    change: impl FnOnce(&mut Window),
+    set_view: &dyn Fn(&mut ViewerState, float2),
+    placeholder: Option<Placeholder>,
 ) {
-    let minimized = unsafe { IsIconic(window.hwnd) } != 0;
-    let placeholder = if minimized || rects_equal(target, &window.client_rect) {
-        None
-    } else {
-        set_view(state, window.center_content_at(target));
-        show_placeholder(window, graphics, state, constants, target)
-    };
-
-    change(window);
     set_view(state, window.center_content());
-
     graphics.update_backbuffer(window.hwnd);
     update_view_constants(constants, state, window.window_dim, window.content_offset());
-    draw_to_back_buffer(graphics, state, constants);
+    draw_to_back_buffer(graphics, state, constants, window);
     graphics.present(1);
 
     if placeholder.is_some() {
@@ -792,6 +1013,111 @@ fn change_window_geometry(
     }
 }
 
+// Keeps every composed frame showing one complete window. A growing window is covered by its
+// next frame and a shrinking window by its last frame. Other changes shrink to the overlap first.
+fn change_window_geometry(
+    window: &mut Window,
+    graphics: &mut GraphicsD3D11,
+    state: &mut ViewerState,
+    constants: &mut Constants,
+    target: &FrameTarget,
+    set_view: &dyn Fn(&mut ViewerState, float2),
+    change: &mut dyn FnMut(&mut Window),
+) {
+    set_transitions_disabled(window.hwnd as _, true);
+    change_window_geometry_steps(window, graphics, state, constants, target, set_view, change);
+    set_transitions_disabled(window.hwnd as _, false);
+}
+
+fn change_window_geometry_steps(
+    window: &mut Window,
+    graphics: &mut GraphicsD3D11,
+    state: &mut ViewerState,
+    constants: &mut Constants,
+    target: &FrameTarget,
+    set_view: &dyn Fn(&mut ViewerState, float2),
+    change: &mut dyn FnMut(&mut Window),
+) {
+    let old = window.client_rect;
+    let new = target.client_rect;
+    let hidden = unsafe { IsIconic(window.hwnd) != 0 || IsWindowVisible(window.hwnd) == 0 };
+
+    if hidden || rects_equal(&new, &old) {
+        change(window);
+        present_window_change(window, graphics, state, constants, set_view, None);
+        return;
+    }
+
+    if rect_contains(&new, &old) {
+        set_view(state, window.center_content_at(&new, target.caption_height));
+        let placeholder = show_placeholder(
+            window,
+            graphics,
+            state,
+            constants,
+            target,
+            PlaceholderContent::NextFrame,
+        );
+        change(window);
+        present_window_change(window, graphics, state, constants, set_view, placeholder);
+        return;
+    }
+
+    let (old_w, old_h) = old.dim();
+    let has_last_frame = graphics.has_last_frame((old_w as u32, old_h as u32));
+    if rect_contains(&old, &new) && has_last_frame {
+        let current = FrameTarget::current(window);
+        let placeholder = show_placeholder(
+            window,
+            graphics,
+            state,
+            constants,
+            &current,
+            PlaceholderContent::LastFrame,
+        );
+        change(window);
+        present_window_change(window, graphics, state, constants, set_view, placeholder);
+        return;
+    }
+
+    let overlap = rect_intersection(&old, &new);
+    let insets = caption::frame_insets(window.window_style);
+    let overlap_window = caption::client_to_window(overlap, &insets);
+    let (overlap_w, overlap_h) = overlap_window.dim();
+    let normal = !window.full_screen && !window.is_maximized() && target.normal_state();
+    let mixed = !rect_contains(&old, &new);
+    if mixed && normal && overlap_w >= WINDOW_MIN_WIDTH && overlap_h >= WINDOW_MIN_HEIGHT {
+        let overlap_target = FrameTarget {
+            client_rect: overlap,
+            caption_height: caption::caption_height(&insets, false),
+            maximized: false,
+        };
+        change_window_geometry_steps(
+            window,
+            graphics,
+            state,
+            constants,
+            &overlap_target,
+            set_view,
+            &mut |window| window.set_normal_client_rect(&overlap),
+        );
+        change_window_geometry_steps(window, graphics, state, constants, target, set_view, change);
+        return;
+    }
+
+    set_view(state, window.center_content_at(&new, target.caption_height));
+    let placeholder = show_placeholder(
+        window,
+        graphics,
+        state,
+        constants,
+        target,
+        PlaceholderContent::NextFrame,
+    );
+    change(window);
+    present_window_change(window, graphics, state, constants, set_view, placeholder);
+}
+
 fn toggle_full_screen(
     window: &mut Window,
     graphics: &mut GraphicsD3D11,
@@ -799,18 +1125,22 @@ fn toggle_full_screen(
     constants: &mut Constants,
 ) {
     let full_screen = !window.full_screen;
-    let target = window.client_rect_for_full_screen(full_screen);
+    let (client_rect, caption_height) = window.client_rect_for_full_screen(full_screen);
+    let target = FrameTarget {
+        client_rect,
+        caption_height,
+        maximized: false,
+    };
     change_window_geometry(
         window,
         graphics,
         state,
         constants,
         &target,
-        |_, _| {},
-        |window| window.set_full_screen(full_screen),
+        &|_, _| {},
+        &mut |window| window.set_full_screen(full_screen),
     );
 }
-
 fn apply_loaded_image(
     state: &mut ViewerState,
     main_window: &mut Window,
@@ -822,6 +1152,11 @@ fn apply_loaded_image(
 ) -> (u32, u32) {
     state.save_shown_image_view(main_window, constants.image_dim);
 
+    let placement = if state.texture.is_some() {
+        WindowPlacement::KeepCenter
+    } else {
+        WindowPlacement::Centered
+    };
     let dim = texture.dim;
     state.texture = Some(texture);
 
@@ -842,24 +1177,28 @@ fn apply_loaded_image(
         }
     };
 
+    if let Some(image_name) = image_name {
+        main_window.set_window_name(image_name);
+    }
+
     if dim_changed && !main_window.full_screen {
-        let plan = main_window.plan_image_size((dim.0 as i32, dim.1 as i32));
-        let target = plan.client_rect;
+        let plan = main_window.plan_image_size((dim.0 as i32, dim.1 as i32), placement);
+        let target = FrameTarget {
+            client_rect: plan.client_rect,
+            caption_height: plan.caption_height,
+            maximized: plan.normal_window_rect.is_none(),
+        };
         change_window_geometry(
             main_window,
             graphics,
             state,
             constants,
             &target,
-            set_view,
-            |window| window.set_image_size(&plan),
+            &set_view,
+            &mut |window| window.set_image_size(&plan),
         );
     } else {
         set_view(state, main_window.center_content());
-    }
-
-    if let Some(image_name) = image_name {
-        main_window.set_window_name(image_name);
     }
 
     dim
@@ -1419,7 +1758,7 @@ fn main() {
                 main_window.window_dim,
                 main_window.content_offset(),
             );
-            draw_to_back_buffer(&graphics, &state, &constants);
+            draw_to_back_buffer(&mut graphics, &state, &constants, &main_window);
 
             let present_interval = if state.is_dragging { 0 } else { 1 };
             graphics.present(present_interval);

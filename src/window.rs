@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use winapi::shared::windef::{HWND, POINT, RECT};
 use winapi::um::winuser::{
-    ClientToScreen, GetClientRect, GetMonitorInfoW, GetSystemMetrics, MonitorFromWindow,
+    ClientToScreen, GetClientRect, GetMonitorInfoW, GetSystemMetrics, GetWindowRect, MonitorFromWindow,
     MONITORINFO, MONITOR_DEFAULTTONEAREST, SM_CXSCREEN,
     SM_CYSCREEN,
 };
@@ -34,6 +34,14 @@ pub fn get_client_rect_absolute(hwnd: HWND) -> RECT {
         GetClientRect(hwnd, &mut client_rect);
     }
     client_rect
+}
+
+pub fn get_window_rect(hwnd: HWND) -> RECT {
+    let mut rect = make_empty_rect();
+    unsafe {
+        GetWindowRect(hwnd, &mut rect);
+    }
+    rect
 }
 
 pub fn get_client_rect(hwnd: HWND) -> RECT {

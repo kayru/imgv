@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use com_ptr::ComPtr;
 use winapi::shared::dxgi1_2::IDXGISwapChain1;
-use winapi::um::d3d11::ID3D11RenderTargetView;
+use winapi::um::d3d11::{ID3D11RenderTargetView, ID3D11Texture2D};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAK, DWMWA_TRANSITIONS_FORCEDISABLED, DWMWINDOWATTRIBUTE, DwmFlush, DwmSetWindowAttribute,
@@ -42,7 +42,7 @@ impl Placeholder {
         owner: *mut std::ffi::c_void,
         graphics: &GraphicsD3D11,
         rect: &ScreenRect,
-        draw: impl Fn(*mut ID3D11RenderTargetView, (u32, u32)),
+        draw: impl Fn(*mut ID3D11RenderTargetView, *mut ID3D11Texture2D, (u32, u32)),
     ) -> Result<Self> {
         unsafe {
             let hinst = GetModuleHandleW(None)?;
@@ -84,12 +84,12 @@ impl Placeholder {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
             let dim = (rect.w as u32, rect.h as u32);
-            let (swapchain, rtv) = graphics
+            let (swapchain, texture, rtv) = graphics
                 .create_swap_chain(hwnd.0 as _, dim)
                 .ok_or_else(|| anyhow!("Placeholder swap chain creation failed"))?;
             placeholder.swapchain = Some(swapchain.clone());
 
-            draw(rtv.as_ptr(), dim);
+            draw(rtv.as_ptr(), texture.as_ptr(), dim);
             swapchain.Present(0, 0);
             if !graphics.wait_for_gpu() {
                 return Err(anyhow!("Placeholder frame timed out on the GPU"));
@@ -97,7 +97,7 @@ impl Placeholder {
             wait_for_composition();
 
             set_dwm_flag(hwnd, DWMWA_CLOAK, false)?;
-            draw(rtv.as_ptr(), dim);
+            draw(rtv.as_ptr(), texture.as_ptr(), dim);
             swapchain.Present(1, 0);
             if !wait_until_presented(&swapchain) {
                 return Err(anyhow!("Placeholder frame timed out before display"));
@@ -113,6 +113,12 @@ impl Drop for Placeholder {
         unsafe {
             let _ = DestroyWindow(self.hwnd);
         }
+    }
+}
+
+pub fn set_transitions_disabled(hwnd: *mut std::ffi::c_void, disabled: bool) {
+    if let Err(e) = set_dwm_flag(HWND(hwnd), DWMWA_TRANSITIONS_FORCEDISABLED, disabled) {
+        log::warn!("Window transition setting failed: {e}");
     }
 }
 

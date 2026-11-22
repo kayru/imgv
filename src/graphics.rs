@@ -85,6 +85,8 @@ pub struct GraphicsD3D11 {
     swap_chain_waitable: Option<winapi::shared::ntdef::HANDLE>,
     frame_statistics: DXGI_FRAME_STATISTICS,
     gpu_fence: Option<GpuFence>,
+    pub caption: Option<crate::caption::CaptionRenderer>,
+    last_frame: Option<(ComPtr<ID3D11Texture2D>, (u32, u32))>,
 }
 
 const GPU_WAIT_TIMEOUT_MS: u32 = 2000;
@@ -398,6 +400,10 @@ impl GraphicsD3D11 {
         };
 
         let gpu_fence = GpuFence::new(device.as_ptr(), context);
+        let caption = crate::caption::CaptionRenderer::new(device.as_ptr() as _);
+        if caption.is_none() {
+            warn!("Caption renderer unavailable");
+        }
         if gpu_fence.is_none() {
             warn!("D3D11 fences unavailable");
         }
@@ -423,6 +429,8 @@ impl GraphicsD3D11 {
             swap_chain_waitable,
             frame_statistics: std::mem::zeroed(),
             gpu_fence,
+            caption,
+            last_frame: None,
         };
 
         result.update_backbuffer(hwnd);
@@ -509,6 +517,78 @@ impl GraphicsD3D11 {
         }
     }
 
+    pub fn save_last_frame(&mut self) {
+        let Some(backbuffer) = &self.backbuffer else {
+            return;
+        };
+
+        let dim = backbuffer.dim;
+        if self.last_frame.as_ref().is_none_or(|(_, d)| *d != dim) {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: dim.0,
+                Height: dim.1,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: BACK_BUFFER_FORMAT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: 0,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let texture = ComPtr::new(|| {
+                let mut obj = null_mut();
+                let hr = unsafe { self.device.CreateTexture2D(&desc, null_mut(), &mut obj) };
+                hresult(obj, hr)
+            });
+            self.last_frame = texture.ok().map(|t| (t, dim));
+        }
+
+        if let Some((texture, _)) = &self.last_frame {
+            unsafe {
+                self.context
+                    .CopyResource(texture.as_ptr() as _, backbuffer.tex.as_ptr() as _);
+            }
+        }
+    }
+
+    pub fn has_last_frame(&self, dim: (u32, u32)) -> bool {
+        self.last_frame
+            .as_ref()
+            .is_some_and(|(_, last)| dim.0 <= last.0 && dim.1 <= last.1)
+    }
+
+    pub fn copy_last_frame(&self, target: *mut ID3D11Texture2D, dim: (u32, u32)) -> bool {
+        let Some((texture, last_dim)) = &self.last_frame else {
+            return false;
+        };
+        if dim.0 > last_dim.0 || dim.1 > last_dim.1 {
+            return false;
+        }
+
+        let region = D3D11_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: dim.0,
+            bottom: dim.1,
+            back: 1,
+        };
+        unsafe {
+            self.context.CopySubresourceRegion(
+                target as _,
+                0,
+                0,
+                0,
+                0,
+                texture.as_ptr() as _,
+                0,
+                &region,
+            );
+        }
+        true
+    }
+
     pub fn wait_for_gpu(&self) -> bool {
         self.gpu_fence.as_ref().is_some_and(|fence| fence.wait())
     }
@@ -517,7 +597,7 @@ impl GraphicsD3D11 {
         &self,
         hwnd: HWND,
         dim: (u32, u32),
-    ) -> Option<(ComPtr<IDXGISwapChain1>, ComPtr<ID3D11RenderTargetView>)> {
+    ) -> Option<(ComPtr<IDXGISwapChain1>, ComPtr<ID3D11Texture2D>, ComPtr<ID3D11RenderTargetView>)> {
         let desc = DXGI_SWAP_CHAIN_DESC1 {
             Width: dim.0,
             Height: dim.1,
@@ -562,7 +642,7 @@ impl GraphicsD3D11 {
                 hresult(obj, hr)
             })
             .ok()?;
-            Some((swapchain, rtv))
+            Some((swapchain, tex, rtv))
         }
     }
 }
