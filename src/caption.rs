@@ -35,7 +35,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     SystemParametersInfoW,
 };
-use windows::core::{Interface, PCWSTR};
+use windows::Win32::Foundation::ERROR_SUCCESS;
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+use windows::core::{Interface, PCWSTR, w};
 
 const BUTTON_WIDTH: f32 = 46.0;
 const GLYPH_SIZE: f32 = 10.0;
@@ -43,11 +45,30 @@ const ICON_SIZE: u32 = 16;
 const ICON_LEFT: f32 = 8.0;
 const TITLE_LEFT: f32 = 30.0;
 
-const BACKGROUND: u32 = 0xf3f3f3;
-const TEXT_ACTIVE: u32 = 0x000000;
-const TEXT_INACTIVE: u32 = 0x929292;
-const BUTTON_HOVER: u32 = 0xe5e5e5;
-const BUTTON_PRESSED: u32 = 0xcccccc;
+struct Palette {
+    background: u32,
+    text_active: u32,
+    text_inactive: u32,
+    button_hover: u32,
+    button_pressed: u32,
+}
+
+const LIGHT_PALETTE: Palette = Palette {
+    background: 0xf3f3f3,
+    text_active: 0x000000,
+    text_inactive: 0x929292,
+    button_hover: 0xe5e5e5,
+    button_pressed: 0xcccccc,
+};
+
+const DARK_PALETTE: Palette = Palette {
+    background: 0x202020,
+    text_active: 0xffffff,
+    text_inactive: 0x717171,
+    button_hover: 0x2d2d2d,
+    button_pressed: 0x292929,
+};
+
 const CLOSE_HOVER: u32 = 0xc42b1c;
 const CLOSE_PRESSED: u32 = 0xc83d2f;
 const CLOSE_GLYPH_HOT: u32 = 0xffffff;
@@ -81,10 +102,47 @@ impl CaptionButton {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Theme {
+    Light,
+    Dark,
+}
+
+impl Theme {
+    pub fn from_system() -> Self {
+        let mut apps_use_light_theme: u32 = 1;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let result = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+                w!("AppsUseLightTheme"),
+                RRF_RT_REG_DWORD,
+                None,
+                Some(&mut apps_use_light_theme as *mut u32 as *mut std::ffi::c_void),
+                Some(&mut size),
+            )
+        };
+        if result == ERROR_SUCCESS && apps_use_light_theme == 0 {
+            Theme::Dark
+        } else {
+            Theme::Light
+        }
+    }
+
+    fn palette(self) -> &'static Palette {
+        match self {
+            Theme::Light => &LIGHT_PALETTE,
+            Theme::Dark => &DARK_PALETTE,
+        }
+    }
+}
+
 pub struct CaptionState {
     hovered: AtomicU8,
     pressed: AtomicU8,
     active: AtomicBool,
+    dark: AtomicBool,
 }
 
 impl CaptionState {
@@ -93,7 +151,21 @@ impl CaptionState {
             hovered: AtomicU8::new(0),
             pressed: AtomicU8::new(0),
             active: AtomicBool::new(true),
+            dark: AtomicBool::new(Theme::from_system() == Theme::Dark),
         }
+    }
+
+    pub fn theme(&self) -> Theme {
+        if self.dark.load(Ordering::Relaxed) {
+            Theme::Dark
+        } else {
+            Theme::Light
+        }
+    }
+
+    pub fn set_theme(&self, theme: Theme) -> bool {
+        let dark = theme == Theme::Dark;
+        self.dark.swap(dark, Ordering::Relaxed) != dark
     }
 
     pub fn hovered(&self) -> CaptionButton {
@@ -249,6 +321,7 @@ pub struct Caption<'a> {
     pub hovered: CaptionButton,
     pub pressed: CaptionButton,
     pub maximized: bool,
+    pub theme: Theme,
 }
 
 pub struct CaptionRenderer {
@@ -472,8 +545,9 @@ impl CaptionRenderer {
             let w = caption.width as f32;
             let h = caption.height as f32;
             let ctx = &self.context;
+            let palette = caption.theme.palette();
 
-            let Some(background) = self.brush(BACKGROUND) else {
+            let Some(background) = self.brush(palette.background) else {
                 return;
             };
             ctx.FillRectangle(&rect(0.0, 0.0, w, h), &background);
@@ -491,9 +565,9 @@ impl CaptionRenderer {
             );
 
             let text_rgb = if caption.active {
-                TEXT_ACTIVE
+                palette.text_active
             } else {
-                TEXT_INACTIVE
+                palette.text_inactive
             };
             let button_w = button_width() as f32;
             let buttons_left = w - 3.0 * button_w;
@@ -524,8 +598,8 @@ impl CaptionRenderer {
                 let fill = match (button, pressed, hot) {
                     (CaptionButton::Close, true, _) => Some(CLOSE_PRESSED),
                     (CaptionButton::Close, false, true) => Some(CLOSE_HOVER),
-                    (_, true, _) => Some(BUTTON_PRESSED),
-                    (_, false, true) => Some(BUTTON_HOVER),
+                    (_, true, _) => Some(palette.button_pressed),
+                    (_, false, true) => Some(palette.button_hover),
                     _ => None,
                 };
                 if let Some(fill) = fill.and_then(|rgb| self.brush(rgb)) {

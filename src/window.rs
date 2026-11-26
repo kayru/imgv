@@ -130,3 +130,21 @@ pub fn disable_rounded_corners(hwnd: HWND) {
         log::debug!("Window corner preference unavailable: {e}");
     }
 }
+
+pub fn set_frame_theme(hwnd: HWND, theme: crate::caption::Theme) {
+    use windows::core::BOOL;
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+
+    let dark = BOOL::from(theme == crate::caption::Theme::Dark);
+    let result = unsafe {
+        DwmSetWindowAttribute(
+            windows::Win32::Foundation::HWND(hwnd as _),
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark as *const _ as _,
+            std::mem::size_of_val(&dark) as u32,
+        )
+    };
+    if let Err(e) = result {
+        log::debug!("Dark window frame unavailable: {e}");
+    }
+}

@@ -55,7 +55,7 @@ mod loader;
 use loader::{load_image_with_metadata, ImageData};
 
 mod caption;
-use caption::{Caption, CaptionButton, CaptionRenderer, CaptionState};
+use caption::{Caption, CaptionButton, CaptionRenderer, CaptionState, Theme};
 
 mod placeholder;
 use placeholder::{set_transitions_disabled, wait_for_composition, Placeholder, ScreenRect};
@@ -218,6 +218,19 @@ unsafe fn handle_caption_message(
     }
 }
 
+unsafe fn is_color_scheme_change(lparam: LPARAM) -> bool {
+    let name = lparam as *const u16;
+    if name.is_null() {
+        return false;
+    }
+
+    "ImmersiveColorScheme"
+        .encode_utf16()
+        .chain(Some(0))
+        .enumerate()
+        .all(|(i, c)| *name.add(i) == c)
+}
+
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     msg: UINT,
@@ -286,6 +299,15 @@ unsafe extern "system" fn window_proc(
                 mmi.ptMinTrackSize.y = WINDOW_MIN_HEIGHT;
             }
             return 0;
+        }
+        WM_SETTINGCHANGE if is_color_scheme_change(lparam) => {
+            if let Some(window_state) = window_state {
+                let theme = Theme::from_system();
+                if window_state.caption.set_theme(theme) {
+                    set_frame_theme(hwnd, theme);
+                    InvalidateRect(hwnd, null_mut(), 0);
+                }
+            }
         }
         WM_SYSCHAR => {
             // Ignore Alt + <key> inputs
@@ -402,6 +424,7 @@ impl Window {
 
                     winapi::um::shellapi::DragAcceptFiles(hwnd, 1);
                     disable_rounded_corners(hwnd);
+                    set_frame_theme(hwnd, window_state.caption.theme());
 
                     // Delay showing this window until D3D is ready to draw something
                     // ShowWindow(hwnd, SW_SHOW);
@@ -960,6 +983,7 @@ fn caption_for<'a>(window: &'a Window, target: &FrameTarget) -> Caption<'a> {
         hovered: window.caption.hovered(),
         pressed: window.caption.pressed(),
         maximized: target.maximized,
+        theme: window.caption.theme(),
     }
 }
 
