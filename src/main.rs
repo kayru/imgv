@@ -388,6 +388,7 @@ impl Window {
                     assert!(hwnd != (0 as HWND), "failed to open the window");
 
                     winapi::um::shellapi::DragAcceptFiles(hwnd, 1);
+                    disable_rounded_corners(hwnd);
 
                     // Delay showing this window until D3D is ready to draw something
                     // ShowWindow(hwnd, SW_SHOW);

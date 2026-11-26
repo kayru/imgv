@@ -125,3 +125,22 @@ fn make_empty_rect() -> RECT {
         bottom: 0,
     }
 }
+
+pub fn disable_rounded_corners(hwnd: HWND) {
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+    };
+
+    let preference = DWMWCP_DONOTROUND;
+    let result = unsafe {
+        DwmSetWindowAttribute(
+            windows::Win32::Foundation::HWND(hwnd as _),
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &preference as *const _ as _,
+            std::mem::size_of_val(&preference) as u32,
+        )
+    };
+    if let Err(e) = result {
+        log::debug!("Window corner preference unavailable: {e}");
+    }
+}
