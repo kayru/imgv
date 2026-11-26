@@ -129,7 +129,7 @@ pub fn align_up(i: i32, alignment: i32) -> i32 {
 }
 
 pub fn float2_round(v: float2) -> float2 {
-    float2::new(v.x as i32 as f32, v.y as i32 as f32)
+    float2::new(v.x.round(), v.y.round())
 }
 
 #[test]

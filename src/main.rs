@@ -604,6 +604,28 @@ impl Window {
         self.center_content_at(&self.client_rect, self.caption_height())
     }
 
+    pub fn screen_to_content(&self, p: POINT) -> float2 {
+        float2::new(
+            (p.x - self.content_anchor.0) as f32,
+            (p.y - self.content_anchor.1) as f32,
+        )
+    }
+
+    fn zoom_anchor(&self) -> float2 {
+        let mut cursor = POINT { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut cursor) } == 0 {
+            return self.center_content();
+        }
+
+        let mut viewport = self.client_rect;
+        viewport.top += self.caption_height();
+        if unsafe { PtInRect(&viewport, cursor) } == 0 {
+            return self.center_content();
+        }
+
+        self.screen_to_content(cursor)
+    }
+
     pub fn client_rect_for_full_screen(&self, full_screen: bool) -> (RECT, i32) {
         if full_screen {
             (get_monitor_rect(self.hwnd), 0)
@@ -714,6 +736,35 @@ struct ImageView {
 
 const DEFAULT_VIEW_TOLERANCE: f32 = 1e-3;
 
+const ZOOM_STEPS_PER_OCTAVE: f32 = 4.0;
+
+fn zoom_level(scale: f32) -> f32 {
+    -scale.log2() * ZOOM_STEPS_PER_OCTAVE
+}
+
+fn zoom_scale(level: f32) -> f32 {
+    let nearest = level.round();
+    let level = if (level - nearest).abs() < 1e-3 {
+        nearest
+    } else {
+        level
+    };
+    (-level / ZOOM_STEPS_PER_OCTAVE).exp2()
+}
+
+#[test]
+fn test_zoom_ladder() {
+    let mut scale = 1.0;
+    for _ in 0..8 {
+        scale = zoom_scale(zoom_level(scale) + 1.0);
+    }
+    assert_eq!(scale, 0.25);
+    for _ in 0..12 {
+        scale = zoom_scale(zoom_level(scale) - 1.0);
+    }
+    assert_eq!(scale, 2.0);
+}
+
 impl ImageView {
     fn is_default(&self, image_dim: float2) -> bool {
         let xfm = &self.xfm_content_to_image;
@@ -748,6 +799,13 @@ impl ViewerState {
             scale,
             offset: 0.5 * image_dim - window_center.mul_element_wise(scale),
         };
+    }
+
+    fn zoom_at(&mut self, scale: f32, anchor_content: float2) {
+        let xfm = &mut self.xfm_content_to_image;
+        let anchor_image = xfm.transform_point(anchor_content);
+        xfm.scale = float2::new(scale, scale);
+        xfm.offset = anchor_image - anchor_content * scale;
     }
 
     fn view(&self, window: &Window) -> ImageView {
@@ -1396,21 +1454,14 @@ fn main() {
                             should_draw = true;
                         }
                         WM_MOUSEWHEEL => {
-                            let scroll_delta = GET_WHEEL_DELTA_WPARAM(wparam);
-                            let zoom = if scroll_delta > 0 {
-                                float2::new(0.8, 0.8)
-                            } else {
-                                float2::new(1.2, 1.2)
+                            let notches =
+                                GET_WHEEL_DELTA_WPARAM(wparam) as f32 / WHEEL_DELTA as f32;
+                            let level = zoom_level(state.xfm_content_to_image.scale.x) + notches;
+                            let cursor = POINT {
+                                x: GET_X_LPARAM(lparam),
+                                y: GET_Y_LPARAM(lparam),
                             };
-                            let mouse_pos_img = state
-                                .xfm_content_to_image
-                                .transform_point(state.mouse_pos_content(&main_window));
-                            let zoom_transform = Transform2D::new_translate(-mouse_pos_img)
-                                .concatenate(Transform2D::new_scale(zoom))
-                                .concatenate(Transform2D::new_translate(mouse_pos_img));
-                            state
-                                .xfm_content_to_image
-                                .inplace_concatenate(zoom_transform);
+                            state.zoom_at(zoom_scale(level), main_window.screen_to_content(cursor));
                             should_draw = true;
                         }
                         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
@@ -1493,18 +1544,10 @@ fn main() {
                                     );
                                 }
                                 (_, '1') | (_, '2') | (_, '3') | (_, '4') | (_, '5') => {
-                                    let s = match wparam as u8 as char {
-                                        '1' => 1.0,
-                                        '2' => 1.0 / 2.0,
-                                        '3' => 1.0 / 4.0,
-                                        '4' => 1.0 / 8.0,
-                                        '5' => 1.0 / 16.0,
-                                        _ => unreachable!(),
-                                    };
-                                    state.center_image(
-                                        float2::new(s, s),
-                                        constants.image_dim,
-                                        main_window.center_content(),
+                                    let octave = (wparam as u8 - b'1') as f32;
+                                    state.zoom_at(
+                                        zoom_scale(octave * ZOOM_STEPS_PER_OCTAVE),
+                                        main_window.zoom_anchor(),
                                     );
                                 }
                                 (_, 'V') if ctrl_down => {
