@@ -2,7 +2,7 @@ use icc_profile::DecodedICCProfile;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader, ImageResult};
 use log::info;
-use nom_exif::{EntryValue, Exif, ExifIter, ExifTag, MediaParser, MediaSource};
+use nom_exif::{EntryValue, Exif, ExifTag};
 use std::path::Path;
 use winapi::shared::dxgiformat::*;
 
@@ -295,13 +295,7 @@ pub struct IccInfo {
 }
 
 fn parse_exif_info(path: &Path) -> Option<ExifInfo> {
-    let ms = MediaSource::file_path(path).ok()?;
-    if !ms.has_exif() {
-        return None;
-    }
-    let mut parser = MediaParser::new();
-    let iter: ExifIter = parser.parse(ms).ok()?;
-    let exif: Exif = iter.into();
+    let exif = nom_exif::read_exif(path).ok()?;
 
     let make = exif_string(&exif, ExifTag::Make);
     let model = exif_string(&exif, ExifTag::Model);
@@ -310,11 +304,7 @@ fn parse_exif_info(path: &Path) -> Option<ExifInfo> {
     let datetime_original = exif_value_string(&exif, ExifTag::DateTimeOriginal);
     let lens_model = exif_string(&exif, ExifTag::LensModel);
     let orientation = exif_u16(&exif, ExifTag::Orientation);
-    let gps_iso6709 = exif
-        .get_gps_info()
-        .ok()
-        .flatten()
-        .map(|gps| gps.format_iso6709());
+    let gps_iso6709 = exif.gps_info().map(|gps| gps.to_iso6709());
 
     Some(ExifInfo {
         make,
