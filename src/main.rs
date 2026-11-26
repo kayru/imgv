@@ -227,13 +227,16 @@ unsafe extern "system" fn window_proc(
     let window_state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowThreadState;
     let window_state = window_state_ptr.as_mut();
 
-    if msg == WM_NCCALCSIZE && wparam != 0 {
+    if msg == WM_NCCALCSIZE {
         let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
         if caption::has_caption(style) {
-            let params = &mut *(lparam as *mut NCCALCSIZE_PARAMS);
+            let rect = if wparam != 0 {
+                &mut (*(lparam as *mut NCCALCSIZE_PARAMS)).rgrc[0]
+            } else {
+                &mut *(lparam as *mut RECT)
+            };
             let maximized = IsZoomed(hwnd) != 0;
-            params.rgrc[0] =
-                caption::window_to_client(params.rgrc[0], &caption::frame_insets(style), maximized);
+            *rect = caption::window_to_client(*rect, &caption::frame_insets(style), maximized);
             return 0;
         }
     }
@@ -459,9 +462,8 @@ impl Window {
         let (work_w, work_h) = work.dim();
 
         if window_w <= work_w && window_h <= work_h {
-            let maximized = unsafe { IsZoomed(self.hwnd) } != 0;
             let (left, top) = match placement {
-                WindowPlacement::KeepCenter if !maximized => {
+                WindowPlacement::KeepCenter => {
                     let current = get_window_rect(self.hwnd);
                     let center_x = (current.left + current.right) / 2;
                     let center_y = (current.top + current.bottom) / 2;
@@ -470,7 +472,7 @@ impl Window {
                         (center_y - window_h / 2).clamp(work.top, work.bottom - window_h),
                     )
                 }
-                _ => (
+                WindowPlacement::Centered => (
                     work.left + (work_w - window_w) / 2,
                     work.top + (work_h - window_h) / 2,
                 ),
@@ -504,23 +506,8 @@ impl Window {
     }
 
     pub fn set_image_size(&mut self, plan: &ImageWindowPlan) {
-        if self.full_screen {
-            self.set_full_screen(false);
-        }
-
         unsafe {
-            let mut placement: WINDOWPLACEMENT = std::mem::zeroed();
-            placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
-            GetWindowPlacement(self.hwnd, &mut placement);
-            let maximized = IsZoomed(self.hwnd) != 0;
-
             match plan.normal_window_rect {
-                Some(rect) if maximized => {
-                    placement.flags = 0;
-                    placement.showCmd = SW_SHOWNORMAL as u32;
-                    placement.rcNormalPosition = screen_to_workspace(self.hwnd, rect);
-                    SetWindowPlacement(self.hwnd, &placement);
-                }
                 Some(rect) => {
                     let (w, h) = rect.dim();
                     SetWindowPos(
@@ -533,12 +520,14 @@ impl Window {
                         0,
                     );
                 }
-                None if !maximized => {
+                None => {
+                    let mut placement: WINDOWPLACEMENT = std::mem::zeroed();
+                    placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+                    GetWindowPlacement(self.hwnd, &mut placement);
                     placement.flags = 0;
                     placement.showCmd = SW_MAXIMIZE as u32;
                     SetWindowPlacement(self.hwnd, &placement);
                 }
-                None => {}
             }
         }
 
@@ -1250,7 +1239,7 @@ fn apply_loaded_image(
         main_window.set_window_name(image_name);
     }
 
-    if dim_changed && !main_window.full_screen {
+    if dim_changed && !main_window.full_screen && !main_window.is_maximized() {
         let plan = main_window.plan_image_size((dim.0 as i32, dim.1 as i32), placement);
         let target = FrameTarget {
             client_rect: plan.client_rect,

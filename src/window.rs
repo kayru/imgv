@@ -80,20 +80,6 @@ pub fn get_monitor_work_rect(hwnd: HWND) -> RECT {
     get_monitor_info(hwnd).rcWork
 }
 
-// WINDOWPLACEMENT positions are relative to the work area, which differs from the monitor
-// rect when an appbar such as the taskbar sits at the top or left.
-pub fn screen_to_workspace(hwnd: HWND, rect: RECT) -> RECT {
-    let info = get_monitor_info(hwnd);
-    let dx = info.rcWork.left - info.rcMonitor.left;
-    let dy = info.rcWork.top - info.rcMonitor.top;
-    RECT {
-        left: rect.left - dx,
-        top: rect.top - dy,
-        right: rect.right - dx,
-        bottom: rect.bottom - dy,
-    }
-}
-
 pub fn rects_equal(a: &RECT, b: &RECT) -> bool {
     a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom
 }
