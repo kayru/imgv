@@ -247,6 +247,16 @@ unsafe extern "system" fn window_proc(
     }
 
     match msg {
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+            SetCapture(hwnd);
+        }
+        WM_LBUTTONUP => {
+            ReleaseCapture();
+        }
+        _ => {}
+    }
+
+    match msg {
         WM_CREATE => {
             let create_struct = lparam as *mut winapi::um::winuser::CREATESTRUCTW;
             let window_state_ptr =
@@ -685,7 +695,7 @@ struct ViewerState {
     frame_number: u32,
     is_resizing: bool,
     is_dragging: bool,
-    drag_origin: float2,
+    drag_last_mouse_pos: float2,
     mouse_pos: float2,
     show_transparency: bool,
     dds_data: Option<DdsTextureData>,
@@ -721,7 +731,7 @@ impl ViewerState {
             frame_number: 0,
             is_resizing: false,
             is_dragging: false,
-            drag_origin: FLOAT2_ZERO,
+            drag_last_mouse_pos: FLOAT2_ZERO,
             mouse_pos: FLOAT2_ZERO,
             show_transparency: false,
             dds_data: None,
@@ -1402,14 +1412,13 @@ fn main() {
                                 .xfm_content_to_image
                                 .inplace_concatenate(zoom_transform);
                             should_draw = true;
-                            state.is_dragging = false;
                         }
-                        WM_LBUTTONDOWN => {
+                        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+                            state.mouse_pos = decode_mouse_pos(lparam);
                             state.is_dragging = true;
-                            state.drag_origin = state.mouse_pos_content(&main_window)
-                                - state.xfm_content_to_image.inverse().offset;
+                            state.drag_last_mouse_pos = state.mouse_pos_content(&main_window);
                         }
-                        WM_LBUTTONUP => {
+                        WM_LBUTTONUP | WM_CAPTURECHANGED => {
                             state.is_dragging = false;
                         }
                         WM_XBUTTONDOWN | WM_XBUTTONDBLCLK => {
@@ -1439,10 +1448,11 @@ fn main() {
                             state.mouse_pos = decode_mouse_pos(lparam);
                             constants.mouse_pos = state.mouse_pos;
                             if state.is_dragging {
-                                let drag_delta =
-                                    state.drag_origin - state.mouse_pos_content(&main_window);
-                                state.xfm_content_to_image.offset =
+                                let mouse_pos_content = state.mouse_pos_content(&main_window);
+                                let drag_delta = state.drag_last_mouse_pos - mouse_pos_content;
+                                state.xfm_content_to_image.offset +=
                                     drag_delta.mul_element_wise(state.xfm_content_to_image.scale);
+                                state.drag_last_mouse_pos = mouse_pos_content;
                             }
                             should_draw = true;
                         }
